@@ -88,9 +88,20 @@ func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthrough
 	s.writeMu.Lock()
 	s.lifecycleMu.Lock()
 
+	if err := ctx.Err(); err != nil {
+		s.lifecycleMu.Unlock()
+		s.writeMu.Unlock()
+		release()
+		return nil, fmt.Errorf("raw passthrough not started, server is shutting down: %w", err)
+	}
+
 	if err := s.retireCurrentSessionForReason(ctx, "raw passthrough"); err != nil {
 		s.lifecycleMu.Unlock()
 		s.writeMu.Unlock()
+		// The retire already cleared s.port even though it could not confirm the
+		// read loop unwound, so without this the loop would sit out its full
+		// backoff with no polling and no safety observation.
+		s.signalReconnect()
 		release()
 		return nil, err
 	}
@@ -154,14 +165,34 @@ func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthrough
 	}
 	handle.closeFn = func() {
 		_ = port.Close()
+		// Release lifecycleMu before clearing the flag. The other order leaves a
+		// window where the flag reads false while lifecycleMu is still held, so a
+		// concurrent SendWake passes the gate and then blocks on lifecycleMu --
+		// while holding the actuation coordinator's mutex.
+		s.lifecycleMu.Unlock()
 		s.writeMu.Lock()
 		s.rawPassthroughActive = false
 		s.writeMu.Unlock()
-		s.lifecycleMu.Unlock()
 		s.signalReconnect()
 		release()
 	}
 	return handle, nil
+}
+
+// StatusPollingActive reports whether the server will poll for protocol-native
+// status once it owns the port again. Overtemperature protection is reachable
+// only through those replies: applyStatusFrameFromSession is the sole caller of
+// monitoring.Controller.Observe, and the display path never reaches it.
+func (s *SerialSource) StatusPollingActive() bool {
+	if s == nil {
+		return false
+	}
+	switch s.pollingMode() {
+	case "both", "status":
+		return s.statusPollEnabled()
+	default:
+		return false
+	}
 }
 
 // Close ends the session, returns the port to the internal read loop and lets
@@ -203,7 +234,6 @@ func (h *RawPassthroughHandle) ObserveFromAmp(chunk []byte) {
 		h.lastStatusAt = time.Now()
 		h.mu.Unlock()
 
-		s.markHealthy()
 		if s.statusState != nil {
 			s.statusState.UpdateProtocolNative(status)
 		}
@@ -220,7 +250,6 @@ func (h *RawPassthroughHandle) ObserveFromAmp(chunk []byte) {
 		h.displayFrames++
 		h.mu.Unlock()
 
-		s.markHealthy()
 		telemetry := protocol.TelemetryFromDisplayState(state, "serial")
 		s.mu.Lock()
 		s.latest = Update{
@@ -238,6 +267,16 @@ func (h *RawPassthroughHandle) ObserveFromAmp(chunk []byte) {
 		// Display-derived temperature is not trusted to actuate the amplifier,
 		// and never does here. It is only good enough to decide to hand the
 		// port back so the fully authorized path can look for itself.
+		//
+		// Require a valid LCD checksum first. The display decoder validates only
+		// the frame boundary and minimum length, and this stream also carries
+		// replies to whatever the raw client sends, so mis-framing is likelier
+		// than in normal operation. An unvalidated frame can decode a bogus TEMP
+		// that would end the operator's session for no reason.
+		flags, ok := protocol.LCDFlagsFromFrame(frame)
+		if !ok || flags == nil || !flags.ChecksumPresent || !flags.ChecksumValid {
+			continue
+		}
 		displayStatus := api.Status{Telemetry: telemetry}
 		displayStatus.Source = "serial"
 		displayStatus.Provenance = "display-frame"
@@ -257,6 +296,14 @@ func (h *RawPassthroughHandle) evaluate(status api.Status, protocolNative bool) 
 	}
 	settings := safetySettings()
 	if !settings.Enabled || !settings.Armed || settings.Thresholds.TemperatureTripC <= 0 {
+		return
+	}
+	// Only end the session if reclaiming the port would actually restore
+	// protection. Without status polling the server can never reach
+	// monitoring.Controller.Observe once it has the port back, so tripping
+	// would take away the operator's live control link -- through which they
+	// could still command STANDBY themselves -- and put nothing in its place.
+	if !s.StatusPollingActive() {
 		return
 	}
 	observed := monitoring.Evaluate(status, settings.Enabled, settings.Thresholds).Observations.MaximumTemperatureC
@@ -302,15 +349,57 @@ func (h *RawPassthroughHandle) Stats() RawPassthroughStats {
 	}
 }
 
-// OvertemperatureProtected reports whether the tap is currently seeing the
-// protocol-native status frames that overtemperature protection depends on.
-// When false, the client is not polling status and the server is flying blind
-// on anything but display-derived readings.
+// OvertemperatureProtected reports whether protection is genuinely engaged for
+// this session. That needs both halves: the tap must be seeing protocol-native
+// status frames, and the server must be configured to poll for status itself,
+// since ending the session is only useful if the reclaimed path can then act.
 func (h *RawPassthroughHandle) OvertemperatureProtected() bool {
 	if h == nil {
+		return false
+	}
+	if h.source == nil || !h.source.StatusPollingActive() {
 		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return !h.lastStatusAt.IsZero() && time.Since(h.lastStatusAt) <= RecentContactWindow
+}
+
+// ProtectionUnavailableReason explains why protection is not engaged, or "" when
+// it is. Callers surface this so an operator is never left to infer safety that
+// is not actually present.
+func (h *RawPassthroughHandle) ProtectionUnavailableReason() string {
+	if h == nil {
+		return "no passthrough session"
+	}
+	if h.source == nil {
+		return "no serial source"
+	}
+	s := h.source
+	s.mu.RLock()
+	safetySettings := s.safetySettings
+	s.mu.RUnlock()
+	if safetySettings == nil {
+		return "safety monitoring is not configured"
+	}
+	settings := safetySettings()
+	if !settings.Enabled {
+		return "safety monitoring is disabled"
+	}
+	if !settings.Armed {
+		return "overtemperature standby is not armed"
+	}
+	if settings.Thresholds.TemperatureTripC <= 0 {
+		return "no overtemperature trip threshold is configured"
+	}
+	if !s.StatusPollingActive() {
+		return "status polling is disabled, so the server could not act on temperature even after reclaiming the port"
+	}
+	h.mu.Lock()
+	stale := h.lastStatusAt.IsZero() || time.Since(h.lastStatusAt) > RecentContactWindow
+	h.mu.Unlock()
+	if stale {
+		return "the connected client is not polling protocol status, so no protocol-native temperature is being observed"
+	}
+	return ""
 }

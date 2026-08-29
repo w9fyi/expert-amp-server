@@ -81,9 +81,15 @@ resumes automatically. A second concurrent client is rejected.
 
 Overtemperature protection stays engaged: the server taps the amplifier→client
 direction as it forwards it, and if temperature reaches the trip threshold it
-ends the session so its own authorized safety path can act. Check
-`GET /api/v1/raw-passthrough` — if the connected client is not polling protocol
-status, the server reports that its view of temperature is display-derived only.
+ends the session so its own authorized safety path can act. That trip only fires
+when reclaiming the port would actually restore protection — with status polling
+disabled the server could not act afterwards, so it keeps the operator's live
+control link instead and reports the gap. After a trip, passthrough stays
+refused until the overtemperature excursion clears.
+
+Check `GET /api/v1/raw-passthrough`: it reports whether protection is genuinely
+engaged, `protectionGapReason` when it is not, and the last trip's reason and
+temperature.
 
 ## API highlights
 

@@ -157,9 +157,25 @@ the next status reply with every existing gate satisfied. Display-derived
 temperature is never trusted to actuate, but is good enough to hand the port
 back so the authorized path can look for itself.
 
-`GET /api/v1/raw-passthrough` reports whether a client is connected and whether
-the tap is currently seeing protocol-native status. If the client polls nothing,
-the server says so plainly rather than implying protection it does not have.
+The trip is deliberately conditional. `applyStatusFrameFromSession` is the only
+caller of `monitoring.Controller.Observe`, so with status polling disabled the
+server could never act even after reclaiming the port — ending the session would
+take away the operator's live control link and put nothing in its place. So
+`evaluate` first checks `SerialSource.StatusPollingActive()` and declines to
+trip when reclaiming would not restore protection, reporting the gap instead.
+Display-derived trips additionally require a valid LCD checksum, because the
+display decoder validates only frame boundaries and this stream also carries
+replies to whatever the raw client sent.
+
+Because the safety controller takes a safety hold for the duration of an
+overtemperature excursion, a passthrough session is refused while that hold is
+active — after a thermal trip the port stays with the server until temperature
+falls back below the reset threshold.
+
+`GET /api/v1/raw-passthrough` reports whether a client is connected, whether
+protection is genuinely engaged, and `protectionGapReason` when it is not, plus
+the reason and temperature of the last trip. An operator is never left to infer
+safety that is not actually present.
 
 ### `cmd/server`
 

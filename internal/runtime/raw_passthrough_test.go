@@ -18,15 +18,22 @@ import (
 
 func newPassthroughTestSource(t *testing.T, opener serial.PortOpener) *SerialSource {
 	t.Helper()
+	return newPassthroughTestSourceWithPolling(t, opener, "both", true)
+}
+
+func newPassthroughTestSourceWithPolling(t *testing.T, opener serial.PortOpener, mode string, statusPoll bool) *SerialSource {
+	t.Helper()
 	return NewSerialSource(SerialSourceConfig{
-		Port:             "/dev/ttyTEST0",
-		BaudRate:         115200,
-		ReadTimeout:      10 * time.Millisecond,
-		ReadSize:         512,
-		MinFrameLen:      64,
-		MaxBuffer:        8192,
-		IOTimeout:        2 * time.Second,
-		ReconnectBackoff: 100 * time.Millisecond,
+		Port:                     "/dev/ttyTEST0",
+		BaudRate:                 115200,
+		ReadTimeout:              10 * time.Millisecond,
+		ReadSize:                 512,
+		MinFrameLen:              64,
+		MaxBuffer:                8192,
+		IOTimeout:                2 * time.Second,
+		ReconnectBackoff:         100 * time.Millisecond,
+		PollingMode:              mode,
+		StatusPollCommandEnabled: statusPoll,
 	}, opener, Update{})
 }
 
@@ -260,4 +267,88 @@ func statusFrameAtTemperature(t *testing.T, temp int) []byte {
 		t.Fatalf("synthesized status frame is invalid: %v", err)
 	}
 	return out
+}
+
+// A trip is only worth taking if reclaiming the port restores protection.
+// applyStatusFrameFromSession is the sole caller of the safety controller, so
+// with status polling off the server could never act once it had the port back
+// -- dropping the client would remove the operator's live control link and put
+// nothing in its place.
+func TestRawPassthroughDoesNotTripWhenStatusPollingIsOff(t *testing.T) {
+	opener := &sequenceSerialOpener{
+		ports:  []serial.Port{&mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}},
+		opened: make(chan int, 3),
+	}
+	src := newPassthroughTestSourceWithPolling(t, opener, "display", false)
+	src.ConfigureSafetyController(monitoring.NewController(nil), func() monitoring.ControlSettings {
+		return monitoring.ControlSettings{
+			Enabled:    true,
+			Armed:      true,
+			Thresholds: monitoring.Thresholds{TemperatureTripC: 50, TemperatureWarningC: 40, TemperatureResetC: 40},
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	src.Start(ctx)
+	defer cancel()
+	waitForCondition(t, time.Second, func() bool { return opener.openCount() == 1 })
+
+	handle, err := src.BeginRawPassthrough(context.Background())
+	if err != nil {
+		t.Fatalf("BeginRawPassthrough error: %v", err)
+	}
+	defer handle.Close()
+
+	handle.ObserveFromAmp(statusFrameAtTemperature(t, 80))
+
+	select {
+	case reason := <-handle.Trip():
+		t.Fatalf("session was ended even though the server could not act afterwards: %+v", reason)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	if handle.OvertemperatureProtected() {
+		t.Fatal("protection must not be reported as engaged when status polling is off")
+	}
+	reason := handle.ProtectionUnavailableReason()
+	if !strings.Contains(reason, "status polling is disabled") {
+		t.Fatalf("expected the status-polling gap to be reported, got %q", reason)
+	}
+}
+
+// A rejected second client must not release the first client's actuation lease.
+// ActuationCoordinator.Acquire is re-entrant for the same owner name, so both
+// sessions would otherwise pass it and the loser's Release would clear the
+// winner's ownership.
+func TestRawPassthroughRejectedClientKeepsFirstLease(t *testing.T) {
+	opener := &sequenceSerialOpener{
+		ports:  []serial.Port{&mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}},
+		opened: make(chan int, 3),
+	}
+	src := newPassthroughTestSource(t, opener)
+	ctx, cancel := context.WithCancel(context.Background())
+	src.Start(ctx)
+	defer cancel()
+	waitForCondition(t, time.Second, func() bool { return opener.openCount() == 1 })
+
+	coordinator := transport.NewActuationCoordinator(src)
+	lease := coordinator.Owner(transport.ActuationOwnerRawPassthrough, false)
+
+	if !lease.Acquire() {
+		t.Fatal("first lease acquire failed")
+	}
+	first, err := src.BeginRawPassthrough(context.Background())
+	if err != nil {
+		t.Fatalf("BeginRawPassthrough error: %v", err)
+	}
+	defer first.Close()
+
+	// The second client is rejected by the claim, and must not touch the lease.
+	if _, err := src.BeginRawPassthrough(context.Background()); !errors.Is(err, ErrRawPassthroughBusy) {
+		t.Fatalf("expected ErrRawPassthroughBusy, got %v", err)
+	}
+
+	if _, err := coordinator.SendButton(context.Background(), api.ButtonAction{Name: "operate"}); transport.ButtonStatusCode(err) != 409 {
+		t.Fatalf("first client's lease was lost: expected 409 from the coordinator, got %v", err)
+	}
 }

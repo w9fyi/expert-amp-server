@@ -15,6 +15,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -31,6 +32,17 @@ const (
 	// copyBufferSize is a single serial read's worth of bytes. The display
 	// frame this amplifier emits is 371 bytes.
 	copyBufferSize = 4096
+
+	// writeTimeout bounds a write to the client. A peer that stops reading but
+	// keeps its socket open holds its receive window at zero; keepalive probes
+	// are still answered, so the connection looks healthy while the forwarding
+	// goroutine blocks forever. That would silently freeze the tap, and with it
+	// overtemperature protection, for as long as the client stays wedged.
+	writeTimeout = 10 * time.Second
+
+	// acceptBackoff paces the accept loop after a temporary error such as fd
+	// exhaustion, instead of spinning at full speed.
+	acceptBackoff = 100 * time.Millisecond
 )
 
 // Lease is the subset of the actuation coordinator this package needs.
@@ -50,6 +62,12 @@ type Config struct {
 // Controller accepts raw TCP clients and leases them the serial port.
 type Controller struct {
 	cfg Config
+
+	// setupMu serializes session setup so the lease and the port are claimed as
+	// one step. Without it two clients can both pass ActuationCoordinator's
+	// Acquire, which is re-entrant for the same owner name, and the loser's
+	// Release would then clear the winner's lease.
+	setupMu sync.Mutex
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -101,7 +119,14 @@ func (c *Controller) Start(ctx context.Context) error {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			// Back off rather than spin: under fd exhaustion Accept returns
+			// immediately and a bare continue would flood the log at full speed.
 			log.Printf("raw passthrough accept failed: %v", err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(acceptBackoff):
+			}
 			continue
 		}
 		go c.serve(ctx, conn)
@@ -116,9 +141,23 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 		_ = tcpConn.SetKeepAlivePeriod(keepAlivePeriod)
 	}
 
+	// Claim the lease and the port as one atomic step; see setupMu.
+	c.setupMu.Lock()
+
+	c.mu.Lock()
+	busy := c.handle != nil
+	c.mu.Unlock()
+	if busy {
+		c.setupMu.Unlock()
+		log.Printf("raw passthrough refused %s: %v", remote, runtime.ErrRawPassthroughBusy)
+		_ = conn.Close()
+		return
+	}
+
 	// Refuse rather than interrupt an automatic transaction that is already
 	// driving the amplifier. Matches the coordinator's reject-don't-queue rule.
 	if c.cfg.Lease != nil && !c.cfg.Lease.Acquire() {
+		c.setupMu.Unlock()
 		log.Printf("raw passthrough refused %s: %s", remote, transport.ActuationBusyError("").Error())
 		_ = conn.Close()
 		return
@@ -129,6 +168,7 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 		if c.cfg.Lease != nil {
 			c.cfg.Lease.Release()
 		}
+		c.setupMu.Unlock()
 		log.Printf("raw passthrough refused %s: %v", remote, err)
 		_ = conn.Close()
 		return
@@ -139,6 +179,11 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 	c.handle = handle
 	c.since = time.Now()
 	c.mu.Unlock()
+	c.setupMu.Unlock()
+
+	if reason := handle.ProtectionUnavailableReason(); reason != "" {
+		log.Printf("raw passthrough %s: overtemperature protection is not engaged for this session: %s", remote, reason)
+	}
 
 	log.Printf("raw passthrough client %s connected; server polling paused", remote)
 
@@ -153,12 +198,31 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 				c.cfg.Lease.Release()
 			}
 			c.mu.Lock()
-			c.conn = nil
-			c.handle = nil
+			// Compare before clearing: a reconnecting client can have already
+			// installed its own session by the time this teardown runs, and
+			// blindly nulling would report "no client connected" while that
+			// session is live and would leave it unreachable on shutdown.
+			if c.handle == handle {
+				c.conn = nil
+				c.handle = nil
+			}
 			c.mu.Unlock()
 		})
 	}
 	defer finish()
+
+	// serve must watch ctx itself. The listener's shutdown watcher takes a
+	// one-shot snapshot of the active connection, so a session that is still
+	// being established when cancellation lands would otherwise never be torn
+	// down, leaking the lifecycle lock and leaving the port with the client.
+	go func() {
+		select {
+		case <-ctx.Done():
+			log.Printf("raw passthrough disconnecting %s: server is shutting down", remote)
+			finish()
+		case <-done:
+		}
+	}()
 
 	// End the session when the tap says overtemperature control must be
 	// restored. Closing the socket unblocks both copies through their normal
@@ -196,26 +260,27 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 		buf := make([]byte, copyBufferSize)
 		port := handle.Port()
 		for {
-			n, err := port.Read(buf)
-			if n > 0 {
-				chunk := buf[:n]
-				if _, werr := conn.Write(chunk); werr != nil {
-					return
-				}
-				// Observe after forwarding so the client is never delayed by
-				// decoding, and never affected by it.
-				handle.ObserveFromAmp(chunk)
-			}
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					continue
-				}
-				return
-			}
 			select {
 			case <-done:
 				return
 			default:
+			}
+
+			n, err := port.Read(buf)
+			if n > 0 {
+				chunk := buf[:n]
+				_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+				if _, werr := conn.Write(chunk); werr != nil {
+					log.Printf("raw passthrough write to client failed, ending session: %v", werr)
+					return
+				}
+				// Observe after forwarding so the client is never delayed by
+				// decoding, and never affected by it. Both stream decoders copy
+				// out of chunk, so reusing buf across iterations is safe.
+				handle.ObserveFromAmp(chunk)
+			}
+			if err != nil && !errors.Is(err, io.EOF) {
+				return
 			}
 		}
 	}()
@@ -256,6 +321,9 @@ type Status struct {
 	StatusFramesObserved     int64  `json:"statusFramesObserved,omitempty"`
 	DisplayFramesObserved    int64  `json:"displayFramesObserved,omitempty"`
 	OvertemperatureProtected bool   `json:"overtemperatureProtected"`
+	ProtectionGapReason      string `json:"protectionGapReason,omitempty"`
+	LastTripReason           string `json:"lastTripReason,omitempty"`
+	LastTripTemperatureC     string `json:"lastTripTemperatureC,omitempty"`
 	Note                     string `json:"note,omitempty"`
 }
 
@@ -268,9 +336,14 @@ func (c *Controller) Status() Status {
 	conn := c.conn
 	handle := c.handle
 	since := c.since
+	lastTrip := c.lastTrip
 	c.mu.Unlock()
 
 	out := Status{Enabled: true, ListenAddress: c.cfg.ListenAddress}
+	if lastTrip != nil {
+		out.LastTripReason = lastTrip.Reason
+		out.LastTripTemperatureC = strconv.FormatFloat(lastTrip.TemperatureC, 'f', 1, 64)
+	}
 	if conn == nil || handle == nil {
 		out.Note = "no raw client connected; the server owns the serial port"
 		return out
@@ -282,10 +355,11 @@ func (c *Controller) Status() Status {
 	out.StatusFramesObserved = stats.StatusFramesSeen
 	out.DisplayFramesObserved = stats.DisplayFrames
 	out.OvertemperatureProtected = handle.OvertemperatureProtected()
+	out.ProtectionGapReason = handle.ProtectionUnavailableReason()
 	if out.OvertemperatureProtected {
 		out.Note = "a raw client holds the serial port; server writes are refused, and overtemperature protection is engaged through the passthrough tap"
 	} else {
-		out.Note = "a raw client holds the serial port and is not polling protocol status; overtemperature protection is blind to protocol-native temperature"
+		out.Note = "a raw client holds the serial port and overtemperature protection is NOT engaged for this session"
 	}
 	return out
 }

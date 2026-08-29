@@ -74,7 +74,12 @@ type Controller struct {
 	conn     net.Conn
 	handle   *runtime.RawPassthroughHandle
 	since    time.Time
-	lastTrip *runtime.TripReason
+	// lastTrip is kept across sessions on purpose: a client that reconnects
+	// after a thermal trip still needs to be able to see why it was dropped.
+	// lastTripAt is what keeps that from reading as a property of the current
+	// session.
+	lastTrip   *runtime.TripReason
+	lastTripAt time.Time
 }
 
 // New builds a Controller. It returns nil when passthrough is not usable, so
@@ -236,6 +241,7 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 			}
 			c.mu.Lock()
 			c.lastTrip = &reason
+			c.lastTripAt = time.Now()
 			c.mu.Unlock()
 			log.Printf("raw passthrough disconnecting %s: %s (%.1fC >= %.1fC)", remote, reason.Reason, reason.TemperatureC, reason.ThresholdC)
 			finish()
@@ -324,6 +330,8 @@ type Status struct {
 	ProtectionGapReason      string `json:"protectionGapReason,omitempty"`
 	LastTripReason           string `json:"lastTripReason,omitempty"`
 	LastTripTemperatureC     string `json:"lastTripTemperatureC,omitempty"`
+	LastTripAt               string `json:"lastTripAt,omitempty"`
+	LastTripInThisSession    bool   `json:"lastTripInThisSession,omitempty"`
 	Note                     string `json:"note,omitempty"`
 }
 
@@ -337,12 +345,16 @@ func (c *Controller) Status() Status {
 	handle := c.handle
 	since := c.since
 	lastTrip := c.lastTrip
+	lastTripAt := c.lastTripAt
 	c.mu.Unlock()
 
 	out := Status{Enabled: true, ListenAddress: c.cfg.ListenAddress}
 	if lastTrip != nil {
 		out.LastTripReason = lastTrip.Reason
 		out.LastTripTemperatureC = strconv.FormatFloat(lastTrip.TemperatureC, 'f', 1, 64)
+		out.LastTripAt = lastTripAt.UTC().Format(time.RFC3339)
+		// Without this an old trip reads as if it described the live session.
+		out.LastTripInThisSession = conn != nil && lastTripAt.After(since)
 	}
 	if conn == nil || handle == nil {
 		out.Note = "no raw client connected; the server owns the serial port"

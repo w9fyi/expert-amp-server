@@ -34,6 +34,7 @@ internal/
   render/       — pixel (PNG) and SVG renderers
   api/          — shared JSON types (telemetry, button action, frame info)
   menudebug/    — guarded menu discovery sessions and sanitized report generation
+  rawpassthrough/ — exclusive raw serial-over-TCP lease for a single external client
 
 fixtures/
   real_home_status_frame.bin  — captured home/status screen
@@ -111,6 +112,54 @@ Shared JSON types:
 - `FrameInfo{Source, Length, StartOffset, ScreenText, LCDFlags}` — frame decode metadata returned by `/api/frame`
 
 These types are defined centrally so the server handlers, runtime, and transports share one schema.
+
+### `internal/rawpassthrough`
+
+Optional, disabled by default. Exposes the amplifier's serial link over TCP so a
+single external client — for example SPE Expert Controller, which connects to a
+"network/serial adapter" over TCP/IP — can drive the amplifier directly through
+the machine already running this server, with no second cable and no separate
+LAN adapter.
+
+The amplifier tolerates one serial master at a time, so this is an **exclusive
+lease, not a multiplexer**:
+
+- With no client connected the server behaves exactly as it always has.
+- When a client connects, `SerialSource.BeginRawPassthrough` stops the internal
+  read loop and waits for it to unwind (the same `retireCurrentSession` handshake
+  `SendWake` uses), then hands the caller its own port handle. Bytes are
+  forwarded verbatim in both directions.
+- On disconnect the port is closed, polling resumes automatically, and the
+  next reconnect is signalled immediately.
+- A second concurrent client is rejected and closed, not queued.
+
+While the lease is held the server refuses its own writes rather than blocking
+on them. `rawPassthroughActive` is read and written only under `writeMu`, and
+both `SendWake` and `writeFrameForSerialSession` take `writeMu` before
+`lifecycleMu`, so they fail fast with HTTP 409 instead of waiting on a lock the
+session holds for as long as an external client stays connected. The session
+also holds an `ActuationCoordinator` lease under
+`ActuationOwnerRawPassthrough`, so button and wake callers get the usual busy
+error before they reach the serial layer, and a passthrough session refuses to
+start while an automatic transaction is already driving the amplifier.
+
+**Overtemperature protection stays engaged.** The amplifier→client direction is
+tapped as it is forwarded: status frames are decoded with the same
+`StatusStreamDecoder` used in normal operation, so if the client polls `0x90`
+the server keeps receiving genuine `provenance: "status-poll"` telemetry at no
+extra cost on the wire. Tapped frames are deliberately **not** delivered to the
+safety, fan or menu-debug controllers — `monitoring.Controller.Observe` latches
+before attempting its toggle, so a tapped frame would spend its single no-retry
+attempt on a port it cannot reach. Instead the tap can only decide to **end the
+session**: on reaching the trip threshold it closes the TCP connection, the
+server reclaims the port, and the normal, fully authorized safety path acts on
+the next status reply with every existing gate satisfied. Display-derived
+temperature is never trusted to actuate, but is good enough to hand the port
+back so the authorized path can look for itself.
+
+`GET /api/v1/raw-passthrough` reports whether a client is connected and whether
+the tap is currently seeing protocol-native status. If the client polls nothing,
+the server says so plainly rather than implying protection it does not have.
 
 ### `cmd/server`
 

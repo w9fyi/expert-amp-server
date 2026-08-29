@@ -21,6 +21,11 @@ const (
 	DefaultFanNormalTemperatureC = 42
 	MinimumFanHysteresisC        = 5
 	FanDisplayProfileFirstSeries = "expert-1.3k-fa-first-series-v1"
+
+	// DefaultRawPassthroughListenAddress matches the TCP port the SPE-LAN-UNIT
+	// exposes its virtual COM port on, so clients already configured for that
+	// unit need no change to point at this server instead.
+	DefaultRawPassthroughListenAddress = ":7388"
 )
 
 type PollingMode string
@@ -83,6 +88,14 @@ type Settings struct {
 	StatusPollIntervalMs     int  `json:"statusPollIntervalMs,omitempty"`
 	SerialAssertDTR          bool `json:"serialAssertDTR"`
 	SerialAssertRTS          bool `json:"serialAssertRTS"`
+
+	// Raw serial-over-TCP passthrough hands the physical port to a single
+	// external client (for example SPE Expert Controller) for the lifetime of
+	// one TCP connection. Disabled by default: while a client is connected the
+	// server cannot issue button writes, and overtemperature protection depends
+	// on the passthrough tap rather than on its own polling.
+	RawPassthroughEnabled       bool   `json:"rawPassthroughEnabled"`
+	RawPassthroughListenAddress string `json:"rawPassthroughListenAddress,omitempty"`
 }
 
 type Snapshot struct {
@@ -148,6 +161,9 @@ type rawSettings struct {
 	SerialPollIntervalMs     *int  `json:"serialPollIntervalMs,omitempty"`
 	SerialAssertDTR          *bool `json:"serialAssertDTR,omitempty"`
 	SerialAssertRTS          *bool `json:"serialAssertRTS,omitempty"`
+
+	RawPassthroughEnabled       *bool   `json:"rawPassthroughEnabled,omitempty"`
+	RawPassthroughListenAddress *string `json:"rawPassthroughListenAddress,omitempty"`
 }
 
 func DefaultSettings(listenAddress string) Settings {
@@ -173,6 +189,11 @@ func DefaultSettings(listenAddress string) Settings {
 		StatusPollIntervalMs:     DefaultPollIntervalMs,
 		SerialAssertDTR:          true,
 		SerialAssertRTS:          true,
+
+		// Off by default. The default address mirrors the SPE-LAN-UNIT's own
+		// virtual-COM port so existing client configurations line up.
+		RawPassthroughEnabled:       false,
+		RawPassthroughListenAddress: DefaultRawPassthroughListenAddress,
 	}
 }
 
@@ -393,6 +414,12 @@ func (r rawSettings) normalize(defaults Settings) Settings {
 	if r.SerialAssertRTS != nil {
 		out.SerialAssertRTS = *r.SerialAssertRTS
 	}
+	if r.RawPassthroughEnabled != nil {
+		out.RawPassthroughEnabled = *r.RawPassthroughEnabled
+	}
+	if r.RawPassthroughListenAddress != nil && strings.TrimSpace(*r.RawPassthroughListenAddress) != "" {
+		out.RawPassthroughListenAddress = strings.TrimSpace(*r.RawPassthroughListenAddress)
+	}
 	return syncLegacyPollingFields(out)
 }
 
@@ -447,6 +474,10 @@ func normalizeSettings(in, defaults Settings) Settings {
 	}
 	out.SerialAssertDTR = in.SerialAssertDTR
 	out.SerialAssertRTS = in.SerialAssertRTS
+	out.RawPassthroughEnabled = in.RawPassthroughEnabled
+	if strings.TrimSpace(in.RawPassthroughListenAddress) != "" {
+		out.RawPassthroughListenAddress = strings.TrimSpace(in.RawPassthroughListenAddress)
+	}
 	return syncLegacyPollingFields(out)
 }
 

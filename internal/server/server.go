@@ -17,6 +17,7 @@ import (
 	"github.com/FtlC-ian/expert-amp-server/internal/font"
 	"github.com/FtlC-ian/expert-amp-server/internal/menudebug"
 	"github.com/FtlC-ian/expert-amp-server/internal/monitoring"
+	"github.com/FtlC-ian/expert-amp-server/internal/rawpassthrough"
 	"github.com/FtlC-ian/expert-amp-server/internal/render"
 	"github.com/FtlC-ian/expert-amp-server/internal/runtime"
 	"github.com/FtlC-ian/expert-amp-server/internal/serial"
@@ -49,6 +50,7 @@ type Options struct {
 	MenuDebugUploader  MenuDebugUploader
 	ButtonTransport    transport.ButtonTransport
 	WakeTransport      transport.WakeTransport
+	RawPassthrough     *rawpassthrough.Controller // nil when raw passthrough is disabled
 	RestartServer      func(context.Context) error
 	Version            VersionInfo
 }
@@ -116,6 +118,9 @@ type settingsRequest struct {
 	SerialPollIntervalMs     *int  `json:"serialPollIntervalMs,omitempty"`
 	SerialAssertDTR          *bool `json:"serialAssertDTR,omitempty"`
 	SerialAssertRTS          *bool `json:"serialAssertRTS,omitempty"`
+
+	RawPassthroughEnabled       *bool   `json:"rawPassthroughEnabled,omitempty"`
+	RawPassthroughListenAddress *string `json:"rawPassthroughListenAddress,omitempty"`
 }
 
 type fanPolicyOverrideRequest struct {
@@ -447,6 +452,22 @@ func NewHandler(opts Options) http.Handler {
 			return
 		}
 		writeAPI(w, http.StatusOK, api.Response{Success: true, Data: opts.SerialSource.Diagnostics()})
+	})
+
+	// Read-only. Raw passthrough is enabled through settings like every other
+	// serial transport option, not by an action endpoint.
+	mux.HandleFunc("/api/v1/raw-passthrough", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethodAPI(w, r, http.MethodGet) {
+			return
+		}
+		if opts.RawPassthrough == nil {
+			writeAPI(w, http.StatusOK, api.Response{Success: true, Data: rawpassthrough.Status{
+				Enabled: false,
+				Note:    "raw serial passthrough is disabled; the server owns the serial port",
+			}})
+			return
+		}
+		writeAPI(w, http.StatusOK, api.Response{Success: true, Data: opts.RawPassthrough.Status()})
 	})
 
 	mux.HandleFunc("/api/v1/serial-ports", func(w http.ResponseWriter, r *http.Request) {
@@ -786,6 +807,8 @@ func mergeSettingsRequest(current config.Settings, req settingsRequest) config.S
 		StatusPollIntervalMs:        pickPositiveInt(current.StatusPollIntervalMs, firstInt(req.StatusPollIntervalMs, req.SerialPollIntervalMs)),
 		SerialAssertDTR:             pickBool(current.SerialAssertDTR, req.SerialAssertDTR),
 		SerialAssertRTS:             pickBool(current.SerialAssertRTS, req.SerialAssertRTS),
+		RawPassthroughEnabled:       pickBool(current.RawPassthroughEnabled, req.RawPassthroughEnabled),
+		RawPassthroughListenAddress: pickOptionalString(current.RawPassthroughListenAddress, req.RawPassthroughListenAddress),
 	}
 }
 

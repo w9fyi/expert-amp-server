@@ -66,6 +66,25 @@ The advanced `serialAssertDTR` and `serialAssertRTS` settings default to `true` 
 
 Third Series Expert 2K-FA production fan control additionally requires the operator-declared actual `fanPolicyFirmwareVersion` setting to equal `Rel.26_03_24_A` or `Rel.08_06_26_A` exactly. Status polling does not attest firmware, so empty, mistyped, case-variant, or other values advertise no supported modes and remain blocked before any amplifier command.
 
+### Raw serial-over-TCP passthrough (optional, off by default)
+
+`rawPassthroughEnabled` exposes the amplifier's serial link on
+`rawPassthroughListenAddress` (default `:7388`, matching the SPE-LAN-UNIT's own
+virtual COM port) so a single external client — such as SPE Expert Controller
+over TCP/IP — can drive the amplifier through the machine already running this
+server, with no second cable.
+
+The amplifier tolerates one serial master, so this is an exclusive lease. While
+a client is connected the server stops its own polling and refuses its own
+button and wake writes with HTTP 409; on disconnect it reclaims the port and
+resumes automatically. A second concurrent client is rejected.
+
+Overtemperature protection stays engaged: the server taps the amplifier→client
+direction as it forwards it, and if temperature reaches the trip threshold it
+ends the session so its own authorized safety path can act. Check
+`GET /api/v1/raw-passthrough` — if the connected client is not polling protocol
+status, the server reports that its view of temperature is display-derived only.
+
 ## API highlights
 
 Canonical API routes live under `/api/v1/...`.

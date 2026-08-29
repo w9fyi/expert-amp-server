@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add an optional raw serial-over-TCP passthrough mode, disabled by default, that leases the amplifier's serial link to a single external client (for example SPE Expert Controller) over the LAN. While a client is connected the server stops its own polling and forwards bytes verbatim in both directions; on disconnect it reclaims the port and resumes automatically. A second concurrent client is rejected rather than queued, and a session refuses to start while an automatic transaction is already driving the amplifier.
+- Keep overtemperature protection engaged during a passthrough session by tapping the amplifier→client direction as it is forwarded. Tapped status frames update telemetry but never reach the safety controller, whose single no-retry attempt would otherwise be spent on a port it cannot reach; on reaching the trip threshold the tap ends the session so the normal authorized safety path acts with every existing gate satisfied.
+- Report passthrough state at `GET /api/v1/raw-passthrough`, including whether the connected client is polling protocol status, so a session that leaves overtemperature protection blind says so plainly.
+
+### Fixed
+
+- Refuse server button and wake writes with HTTP 409 while a raw passthrough client holds the serial port, instead of blocking on a lock held for the client's entire connection. `SendWake` takes `writeMu` before `lifecycleMu` and runs under the actuation coordinator's mutex, so waiting there would have wedged every actuation path — including overtemperature safety — until the external client disconnected.
+
 ## v0.4.8 - 2026-08-31
 
 Actuation-coordination safety release.

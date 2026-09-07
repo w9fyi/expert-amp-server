@@ -316,10 +316,11 @@ func TestRawPassthroughDoesNotTripWhenStatusPollingIsOff(t *testing.T) {
 	}
 }
 
-// A rejected second client must not release the first client's actuation lease.
-// ActuationCoordinator.Acquire is re-entrant for the same owner name, so both
-// sessions would otherwise pass it and the loser's Release would clear the
-// winner's ownership.
+// A rejected second client must not disturb the first client's actuation lease.
+// Before v0.4.8 Acquire was re-entrant for the same owner name, so both
+// sessions passed it and the loser's Release cleared the winner's ownership.
+// The coordinator now refuses the second acquisition outright and scopes
+// Release to the exact lease instance; this asserts both halves.
 func TestRawPassthroughRejectedClientKeepsFirstLease(t *testing.T) {
 	opener := &sequenceSerialOpener{
 		ports:  []serial.Port{&mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}},
@@ -332,9 +333,10 @@ func TestRawPassthroughRejectedClientKeepsFirstLease(t *testing.T) {
 	waitForCondition(t, time.Second, func() bool { return opener.openCount() == 1 })
 
 	coordinator := transport.NewActuationCoordinator(src)
-	lease := coordinator.Owner(transport.ActuationOwnerRawPassthrough, false)
+	owner := coordinator.Owner(transport.ActuationOwnerRawPassthrough, false)
 
-	if !lease.Acquire() {
+	firstLease := owner.Acquire()
+	if firstLease == nil {
 		t.Fatal("first lease acquire failed")
 	}
 	first, err := src.BeginRawPassthrough(context.Background())
@@ -342,6 +344,13 @@ func TestRawPassthroughRejectedClientKeepsFirstLease(t *testing.T) {
 		t.Fatalf("BeginRawPassthrough error: %v", err)
 	}
 	defer first.Close()
+
+	// The same owner name must not acquire twice. If it did, the second
+	// lease's Release would be free to clear the first session's ownership.
+	if second := owner.Acquire(); second != nil {
+		second.Release()
+		t.Fatal("second acquire returned a lease while the first was still held")
+	}
 
 	// The second client is rejected by the claim, and must not touch the lease.
 	if _, err := src.BeginRawPassthrough(context.Background()); !errors.Is(err, ErrRawPassthroughBusy) {

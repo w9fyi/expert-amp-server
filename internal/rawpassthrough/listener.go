@@ -46,9 +46,11 @@ const (
 )
 
 // Lease is the subset of the actuation coordinator this package needs.
+// Acquire returns nil when another owner holds actuation; a non-nil result is
+// the identity of this session's acquisition and only it can release the
+// reservation.
 type Lease interface {
-	Acquire() bool
-	Release()
+	Acquire() transport.ActuationLease
 }
 
 // Config configures a Controller.
@@ -64,9 +66,11 @@ type Controller struct {
 	cfg Config
 
 	// setupMu serializes session setup so the lease and the port are claimed as
-	// one step. Without it two clients can both pass ActuationCoordinator's
-	// Acquire, which is re-entrant for the same owner name, and the loser's
-	// Release would then clear the winner's lease.
+	// one step, and so a refusal is decided before either is taken. Since
+	// v0.4.8 the coordinator itself also rejects a second concurrent
+	// acquisition by the same owner name and scopes Release to the exact lease
+	// instance, so this no longer guards a lost-lease bug — only the ordering
+	// between the coordinator reservation and the serial port claim.
 	setupMu sync.Mutex
 
 	mu       sync.Mutex
@@ -161,17 +165,20 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 
 	// Refuse rather than interrupt an automatic transaction that is already
 	// driving the amplifier. Matches the coordinator's reject-don't-queue rule.
-	if c.cfg.Lease != nil && !c.cfg.Lease.Acquire() {
-		c.setupMu.Unlock()
-		log.Printf("raw passthrough refused %s: %s", remote, transport.ActuationBusyError("").Error())
-		_ = conn.Close()
-		return
+	var lease transport.ActuationLease
+	if c.cfg.Lease != nil {
+		if lease = c.cfg.Lease.Acquire(); lease == nil {
+			c.setupMu.Unlock()
+			log.Printf("raw passthrough refused %s: %s", remote, transport.ActuationBusyError("").Error())
+			_ = conn.Close()
+			return
+		}
 	}
 
 	handle, err := c.cfg.Source.BeginRawPassthrough(ctx)
 	if err != nil {
-		if c.cfg.Lease != nil {
-			c.cfg.Lease.Release()
+		if lease != nil {
+			lease.Release()
 		}
 		c.setupMu.Unlock()
 		log.Printf("raw passthrough refused %s: %v", remote, err)
@@ -199,8 +206,11 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 			close(done)
 			_ = conn.Close()
 			handle.Close()
-			if c.cfg.Lease != nil {
-				c.cfg.Lease.Release()
+			// Releasing this exact lease is a no-op unless it is still the
+			// coordinator's current reservation, so a late teardown cannot
+			// clear a newer session's ownership.
+			if lease != nil {
+				lease.Release()
 			}
 			c.mu.Lock()
 			// Compare before clearing: a reconnecting client can have already

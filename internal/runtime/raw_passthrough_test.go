@@ -363,6 +363,45 @@ func TestRawPassthroughTapGoesStaleWhenClientStopsPolling(t *testing.T) {
 	}
 }
 
+// A passthrough session that tears down late must not clear the reservation a
+// newer session has since taken. Release is scoped to the exact lease instance,
+// so the stale release is a no-op and the newer holder keeps ownership.
+func TestRawPassthroughStaleReleaseCannotClearNewerLease(t *testing.T) {
+	opener := &sequenceSerialOpener{
+		ports:  []serial.Port{&mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}},
+		opened: make(chan int, 3),
+	}
+	src := newPassthroughTestSource(t, opener)
+	ctx, cancel := context.WithCancel(context.Background())
+	src.Start(ctx)
+	defer cancel()
+	waitForCondition(t, time.Second, func() bool { return opener.openCount() == 1 })
+
+	coordinator := transport.NewActuationCoordinator(src)
+	owner := coordinator.Owner(transport.ActuationOwnerRawPassthrough, false)
+
+	stale := owner.Acquire()
+	if stale == nil {
+		t.Fatal("first lease acquire failed")
+	}
+	stale.Release()
+
+	current := owner.Acquire()
+	if current == nil {
+		t.Fatal("second lease acquire failed after the first was released")
+	}
+
+	// The first session's teardown runs late, after the second already owns
+	// actuation. Release is idempotent, so this must not touch the newer lease.
+	stale.Release()
+
+	if _, err := coordinator.SendButton(context.Background(), api.ButtonAction{Name: "operate"}); transport.ButtonStatusCode(err) != 409 {
+		t.Fatalf("a stale release cleared the newer session's ownership: expected 409, got %v", err)
+	}
+
+	current.Release()
+}
+
 // A rejected second client must not disturb the first client's actuation lease.
 // Before v0.4.8 Acquire was re-entrant for the same owner name, so both
 // sessions passed it and the loser's Release cleared the winner's ownership.

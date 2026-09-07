@@ -112,7 +112,11 @@ func (s *StatusState) Resolve(snapshot Snapshot) api.Status {
 	}
 	status := s.CurrentProtocolNative()
 	protocolAt := s.protocolUpdatedAt()
-	if status.Provenance != "status-poll" {
+	// Resolve is the display path, so it merges tapped state too. The
+	// provenance travels with the merged status, so callers that need
+	// authority -- fan policy, overtemperature standby, menu debug -- still
+	// see "passthrough-tap" and refuse it. Only the display is widened here.
+	if status.Provenance != "status-poll" && status.Provenance != ProvenancePassthroughTap {
 		return applyContactMetadata(fallback, snapshot.UpdatedAt, protocolAt)
 	}
 	resolved := mergeProtocolNativeStatus(status, fallback)

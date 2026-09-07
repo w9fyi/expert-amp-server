@@ -302,6 +302,20 @@ func newServerWithUploader(cfg *config.Manager, pollInterval time.Duration, stop
 		ListenAddress: snapshot.Settings.RawPassthroughListenAddress,
 		Source:        serialSource,
 		Lease:         rawPassthroughLease,
+		// Read live rather than from the startup snapshot: an operator can arm
+		// either control after the server starts, and the refusal has to
+		// reflect what is armed at the moment a client connects.
+		ArmedAutomaticControls: func() []string {
+			settings := cfg.Get().Settings
+			var armed []string
+			if settings.AutomaticFanPolicyEnabled {
+				armed = append(armed, "automatic fan control")
+			}
+			if settings.SafetyMonitoringEnabled && settings.OvertemperatureStandbyArmed {
+				armed = append(armed, "overtemperature standby")
+			}
+			return armed
+		},
 	})
 	safetyController := monitoring.NewController(safetyButtonTransport)
 	fanPolicyController := fanpolicy.NewController(fanButtonTransport)

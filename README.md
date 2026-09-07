@@ -79,17 +79,24 @@ a client is connected the server stops its own polling and refuses its own
 button and wake writes with HTTP 409; on disconnect it reclaims the port and
 resumes automatically. A second concurrent client is rejected.
 
-Overtemperature protection stays engaged: the server taps the amplifier→client
-direction as it forwards it, and if temperature reaches the trip threshold it
-ends the session so its own authorized safety path can act. That trip only fires
-when reclaiming the port would actually restore protection — with status polling
-disabled the server could not act afterwards, so it keeps the operator's live
-control link instead and reports the gap. After a trip, passthrough stays
-refused until the overtemperature excursion clears.
+**Server-side automatic controls are unavailable during a session, and a session
+is refused rather than started while one is armed.** If automatic fan control or
+overtemperature standby is armed, a connecting client is refused with a `409`
+that names each control to disarm. Nothing is silently suspended and nothing is
+automatically restored afterwards — choosing passthrough means knowingly running
+without those controls for as long as the client is connected. The amplifier's
+own firmware stepdown is unaffected.
 
-Check `GET /api/v1/raw-passthrough`: it reports whether protection is genuinely
-engaged, `protectionGapReason` when it is not, and the last trip's reason and
-temperature.
+The dashboard and API keep working meanwhile: the server passively decodes the
+amplifier→client direction as it forwards it, so while the external client polls
+status, telemetry keeps updating. That state is labelled
+`provenance: "passthrough-tap"`, is shown for display only, goes stale normally
+when the client stops polling, and is never accepted as authority to actuate the
+amplifier. The server injects no bytes of its own while the lease is held.
+
+Check `GET /api/v1/raw-passthrough`: it reports `blockedByArmedControls` when a
+session would be refused, `tapFresh` for display freshness, and
+`automaticControlsAvailable`, which is always false during a session.
 
 ## API highlights
 

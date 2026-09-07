@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -224,6 +226,92 @@ func TestPassthroughRejectsSecondConcurrentClient(t *testing.T) {
 	_ = second.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := second.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("expected the second client to be closed immediately, got %v", err)
+	}
+}
+
+// A session must be refused, not silently degraded, while a server-side
+// automatic control is armed. The refusal has to name every control the
+// operator must disarm.
+func TestPassthroughRefusesWhileAutomaticControlsAreArmed(t *testing.T) {
+	controller, opener, cancel := newTestController(t)
+	defer cancel()
+
+	armed := []string{"automatic fan control", "overtemperature standby"}
+	controller.cfg.ArmedAutomaticControls = func() []string { return armed }
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	addr := startListener(t, ctx, controller)
+
+	baseline := opener.count()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected the client to be refused and closed, got %v", err)
+	}
+
+	// Refused before anything was taken: the serial port was never stolen.
+	if got := opener.count(); got != baseline {
+		t.Fatalf("serial port was opened for a refused session: count %d -> %d", baseline, got)
+	}
+
+	status := controller.Status()
+	if len(status.BlockedByArmedControls) != len(armed) {
+		t.Fatalf("status.BlockedByArmedControls = %v, want %v", status.BlockedByArmedControls, armed)
+	}
+	for _, want := range armed {
+		if !strings.Contains(status.Note, want) {
+			t.Fatalf("status note %q does not name %q", status.Note, want)
+		}
+	}
+}
+
+// The refusal carries 409: it conflicts with current server state and succeeds
+// unchanged once that state is corrected.
+func TestAutomaticControlsArmedErrorReports409AndNamesEachControl(t *testing.T) {
+	err := ErrAutomaticControlsArmed([]string{"automatic fan control", "overtemperature standby"})
+
+	var armedErr *AutomaticControlsArmedError
+	if !errors.As(err, &armedErr) {
+		t.Fatalf("expected an *AutomaticControlsArmedError, got %T", err)
+	}
+	if got := armedErr.HTTPStatus(); got != http.StatusConflict {
+		t.Fatalf("HTTPStatus() = %d, want %d", got, http.StatusConflict)
+	}
+	for _, want := range []string{"automatic fan control", "overtemperature standby"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not name %q", err.Error(), want)
+		}
+	}
+}
+
+// With nothing armed the gate must stay out of the way entirely.
+func TestPassthroughAcceptsWhenNoAutomaticControlsAreArmed(t *testing.T) {
+	controller, opener, cancel := newTestController(t)
+	defer cancel()
+
+	controller.cfg.ArmedAutomaticControls = func() []string { return nil }
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	addr := startListener(t, ctx, controller)
+
+	baseline := opener.count()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	opener.waitForNewPort(t, baseline)
+
+	if status := controller.Status(); !status.ClientConnected {
+		t.Fatalf("expected the session to be accepted, got %+v", status)
 	}
 }
 

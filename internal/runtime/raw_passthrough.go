@@ -4,12 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
 	"github.com/FtlC-ian/expert-amp-server/internal/api"
-	"github.com/FtlC-ian/expert-amp-server/internal/monitoring"
 	"github.com/FtlC-ian/expert-amp-server/internal/protocol"
 	"github.com/FtlC-ian/expert-amp-server/internal/serial"
 	"github.com/FtlC-ian/expert-amp-server/internal/tempunit"
@@ -21,13 +19,13 @@ var ErrRawPassthroughBusy = errors.New("a raw passthrough client is already conn
 // ErrRawPassthroughUnavailable reports that no serial port is configured.
 var ErrRawPassthroughUnavailable = errors.New("raw passthrough requires a configured serial port")
 
-// TripReason explains why the passthrough tap asked for the session to end.
-type TripReason struct {
-	Reason         string
-	TemperatureC   float64
-	ThresholdC     float64
-	ProtocolNative bool
-}
+// ProvenancePassthroughTap marks status observed by copying another client's
+// traffic during a raw lease. It is deliberately distinct from "status-poll":
+// the amplifier answered a question the server did not ask, so the reply is
+// good enough to display but is never authority to actuate. Every automatic
+// actuation gate tests for "status-poll" exactly, so this value is refused by
+// fan policy, overtemperature standby, and menu debug without further work.
+const ProvenancePassthroughTap = "passthrough-tap"
 
 // RawPassthroughHandle is one exclusive raw session over the physical serial
 // port. The read loop is fully stopped for its lifetime: the caller owns the
@@ -35,7 +33,8 @@ type TripReason struct {
 //
 // The amplifier tolerates a single serial master, so this is a lease rather
 // than a multiplexer. The server keeps observing the amp->client direction
-// (see ObserveFromAmp) but never writes while the lease is held.
+// (see ObserveFromAmp) but never writes while the lease is held, and never
+// ends the session on what it observes.
 type RawPassthroughHandle struct {
 	source *SerialSource
 	port   serial.Port
@@ -46,9 +45,6 @@ type RawPassthroughHandle struct {
 	statusDecoder  *protocol.StatusStreamDecoder
 	displayDecoder *protocol.DisplayStreamDecoder
 
-	trip     chan TripReason
-	tripOnce sync.Once
-
 	mu               sync.Mutex
 	startedAt        time.Time
 	statusFramesSeen int64
@@ -58,10 +54,6 @@ type RawPassthroughHandle struct {
 
 // Port is the exclusive serial handle for the duration of the session.
 func (h *RawPassthroughHandle) Port() serial.Port { return h.port }
-
-// Trip fires when the tap concludes the session must end so the server can
-// reclaim the port. It is never used to actuate the amplifier directly.
-func (h *RawPassthroughHandle) Trip() <-chan TripReason { return h.trip }
 
 // BeginRawPassthrough stops the internal read loop, waits for it to unwind, and
 // returns an exclusive handle to the serial port.
@@ -160,7 +152,6 @@ func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthrough
 		port:           port,
 		statusDecoder:  protocol.NewStatusStreamDecoder(),
 		displayDecoder: protocol.NewDisplayStreamDecoder(protocol.StreamDecoderConfig{MinFrameLen: s.cfg.MinFrameLen, MaxBuffer: s.cfg.MaxBuffer}),
-		trip:           make(chan TripReason, 1),
 		startedAt:      time.Now(),
 	}
 	handle.closeFn = func() {
@@ -207,12 +198,12 @@ func (h *RawPassthroughHandle) Close() {
 // ObserveFromAmp decodes a chunk of the amplifier->client byte stream without
 // consuming or altering it. The caller still forwards the same bytes verbatim.
 //
-// Frames observed this way update telemetry, but are deliberately NOT delivered
-// to the safety, fan or menu-debug controllers: those act on what they see, and
-// monitoring.Controller.Observe latches before attempting its toggle, so a
-// tapped frame would burn its single no-retry attempt on a write that cannot
-// succeed while the port is leased. Instead the tap only ever decides to end
-// the session, after which the normal authorized path runs unmodified.
+// This is display evidence only. Frames observed here are labelled
+// ProvenancePassthroughTap and are never delivered to the safety, fan or
+// menu-debug controllers, and never end the session. Server-side automatic
+// control is not degraded during a lease, it is refused up front: a session
+// cannot start while automatic fan control or overtemperature standby is armed
+// (see ArmedAutomaticControls), so there is no protection here to preserve.
 func (h *RawPassthroughHandle) ObserveFromAmp(chunk []byte) {
 	if h == nil || len(chunk) == 0 || h.source == nil {
 		return
@@ -234,10 +225,13 @@ func (h *RawPassthroughHandle) ObserveFromAmp(chunk []byte) {
 		h.lastStatusAt = time.Now()
 		h.mu.Unlock()
 
+		// Relabel before publishing. protocol decoding stamps "status-poll",
+		// which is the exact string every actuation gate treats as authority,
+		// and the server did not send this poll.
+		status.Provenance = ProvenancePassthroughTap
 		if s.statusState != nil {
 			s.statusState.UpdateProtocolNative(status)
 		}
-		h.evaluate(status, true)
 	}
 
 	for _, frame := range h.displayDecoder.Push(chunk) {
@@ -263,67 +257,7 @@ func (h *RawPassthroughHandle) ObserveFromAmp(chunk []byte) {
 		s.framesSeen.Add(1)
 		s.lastFrameLen.Store(int64(len(frame)))
 		s.lastFrameAt.Store(time.Now().Unix())
-
-		// Display-derived temperature is not trusted to actuate the amplifier,
-		// and never does here. It is only good enough to decide to hand the
-		// port back so the fully authorized path can look for itself.
-		//
-		// Require a valid LCD checksum first. The display decoder validates only
-		// the frame boundary and minimum length, and this stream also carries
-		// replies to whatever the raw client sends, so mis-framing is likelier
-		// than in normal operation. An unvalidated frame can decode a bogus TEMP
-		// that would end the operator's session for no reason.
-		flags, ok := protocol.LCDFlagsFromFrame(frame)
-		if !ok || flags == nil || !flags.ChecksumPresent || !flags.ChecksumValid {
-			continue
-		}
-		displayStatus := api.Status{Telemetry: telemetry}
-		displayStatus.Source = "serial"
-		displayStatus.Provenance = "display-frame"
-		h.evaluate(displayStatus, false)
 	}
-}
-
-// evaluate ends the session if temperature has reached the configured trip
-// threshold. It never writes to the amplifier.
-func (h *RawPassthroughHandle) evaluate(status api.Status, protocolNative bool) {
-	s := h.source
-	s.mu.RLock()
-	safetySettings := s.safetySettings
-	s.mu.RUnlock()
-	if safetySettings == nil {
-		return
-	}
-	settings := safetySettings()
-	if !settings.Enabled || !settings.Armed || settings.Thresholds.TemperatureTripC <= 0 {
-		return
-	}
-	// Only end the session if reclaiming the port would actually restore
-	// protection. Without status polling the server can never reach
-	// monitoring.Controller.Observe once it has the port back, so tripping
-	// would take away the operator's live control link -- through which they
-	// could still command STANDBY themselves -- and put nothing in its place.
-	if !s.StatusPollingActive() {
-		return
-	}
-	observed := monitoring.Evaluate(status, settings.Enabled, settings.Thresholds).Observations.MaximumTemperatureC
-	if observed == nil || *observed < settings.Thresholds.TemperatureTripC {
-		return
-	}
-	h.signalTrip(TripReason{
-		Reason:         "temperature reached the overtemperature trip threshold",
-		TemperatureC:   *observed,
-		ThresholdC:     settings.Thresholds.TemperatureTripC,
-		ProtocolNative: protocolNative,
-	})
-}
-
-func (h *RawPassthroughHandle) signalTrip(reason TripReason) {
-	h.tripOnce.Do(func() {
-		log.Printf("raw passthrough: ending session to restore overtemperature control (%.1fC >= %.1fC, protocolNative=%t)", reason.TemperatureC, reason.ThresholdC, reason.ProtocolNative)
-		h.trip <- reason
-		close(h.trip)
-	})
 }
 
 // RawPassthroughStats describes an active passthrough session for status reporting.
@@ -349,57 +283,15 @@ func (h *RawPassthroughHandle) Stats() RawPassthroughStats {
 	}
 }
 
-// OvertemperatureProtected reports whether protection is genuinely engaged for
-// this session. That needs both halves: the tap must be seeing protocol-native
-// status frames, and the server must be configured to poll for status itself,
-// since ending the session is only useful if the reclaimed path can then act.
-func (h *RawPassthroughHandle) OvertemperatureProtected() bool {
+// TapIsFresh reports whether the connected client is currently supplying
+// protocol status often enough for tapped telemetry to be worth displaying.
+// It says nothing about protection: tapped state is never authority to
+// actuate, however fresh it is.
+func (h *RawPassthroughHandle) TapIsFresh() bool {
 	if h == nil {
-		return false
-	}
-	if h.source == nil || !h.source.StatusPollingActive() {
 		return false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return !h.lastStatusAt.IsZero() && time.Since(h.lastStatusAt) <= RecentContactWindow
-}
-
-// ProtectionUnavailableReason explains why protection is not engaged, or "" when
-// it is. Callers surface this so an operator is never left to infer safety that
-// is not actually present.
-func (h *RawPassthroughHandle) ProtectionUnavailableReason() string {
-	if h == nil {
-		return "no passthrough session"
-	}
-	if h.source == nil {
-		return "no serial source"
-	}
-	s := h.source
-	s.mu.RLock()
-	safetySettings := s.safetySettings
-	s.mu.RUnlock()
-	if safetySettings == nil {
-		return "safety monitoring is not configured"
-	}
-	settings := safetySettings()
-	if !settings.Enabled {
-		return "safety monitoring is disabled"
-	}
-	if !settings.Armed {
-		return "overtemperature standby is not armed"
-	}
-	if settings.Thresholds.TemperatureTripC <= 0 {
-		return "no overtemperature trip threshold is configured"
-	}
-	if !s.StatusPollingActive() {
-		return "status polling is disabled, so the server could not act on temperature even after reclaiming the port"
-	}
-	h.mu.Lock()
-	stale := h.lastStatusAt.IsZero() || time.Since(h.lastStatusAt) > RecentContactWindow
-	h.mu.Unlock()
-	if stale {
-		return "the connected client is not polling protocol status, so no protocol-native temperature is being observed"
-	}
-	return ""
 }

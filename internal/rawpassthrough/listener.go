@@ -5,17 +5,23 @@
 // lease, not a multiplexer: while a client is connected the server's own
 // polling is stopped and its writes are refused. Bytes are forwarded verbatim
 // in both directions. The amplifier->client direction is additionally tapped
-// (without altering it) so telemetry keeps flowing and overtemperature
-// protection stays engaged.
+// (without altering it) so the API and UI keep showing telemetry, labelled
+// passthrough-tap and treated as display evidence only.
+//
+// Server-side automatic control is not weakened during a lease, it is refused
+// before one starts: a session cannot begin while automatic fan control or
+// overtemperature standby is armed.
 package rawpassthrough
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
-	"strconv"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +51,39 @@ const (
 	acceptBackoff = 100 * time.Millisecond
 )
 
+// AutomaticControlsArmedError reports that a passthrough session was refused
+// because server-side automatic controls are armed. Controls names every
+// control the operator must disarm, so a caller never has to guess which one.
+type AutomaticControlsArmedError struct {
+	Controls []string
+}
+
+func (e *AutomaticControlsArmedError) Error() string {
+	return fmt.Sprintf(
+		"raw passthrough is unavailable while these automatic controls are armed: %s. "+
+			"The server sends no serial bytes of its own during a passthrough lease, so they could not act. "+
+			"Disarm them explicitly to use passthrough.",
+		strings.Join(e.Controls, ", "),
+	)
+}
+
+// HTTPStatus is 409: the request conflicts with current server state, and
+// succeeds unchanged once that state is corrected.
+func (e *AutomaticControlsArmedError) HTTPStatus() int { return http.StatusConflict }
+
+// ErrAutomaticControlsArmed builds the refusal for the named armed controls.
+func ErrAutomaticControlsArmed(controls []string) error {
+	return &AutomaticControlsArmedError{Controls: controls}
+}
+
+// armedControls reports which server-side automatic controls are armed.
+func (c *Controller) armedControls() []string {
+	if c == nil || c.cfg.ArmedAutomaticControls == nil {
+		return nil
+	}
+	return c.cfg.ArmedAutomaticControls()
+}
+
 // Lease is the subset of the actuation coordinator this package needs.
 // Acquire returns nil when another owner holds actuation; a non-nil result is
 // the identity of this session's acquisition and only it can release the
@@ -59,6 +98,13 @@ type Config struct {
 	ListenAddress string
 	Source        *runtime.SerialSource
 	Lease         Lease
+
+	// ArmedAutomaticControls names the server-side automatic controls that are
+	// currently armed, or nil when none are. A passthrough session is refused
+	// while it returns anything: the server sends no bytes of its own during a
+	// lease, so those controls could not act, and an operator must disarm them
+	// knowingly rather than have them silently suspended and restored.
+	ArmedAutomaticControls func() []string
 }
 
 // Controller accepts raw TCP clients and leases them the serial port.
@@ -78,12 +124,6 @@ type Controller struct {
 	conn     net.Conn
 	handle   *runtime.RawPassthroughHandle
 	since    time.Time
-	// lastTrip is kept across sessions on purpose: a client that reconnects
-	// after a thermal trip still needs to be able to see why it was dropped.
-	// lastTripAt is what keeps that from reading as a property of the current
-	// session.
-	lastTrip   *runtime.TripReason
-	lastTripAt time.Time
 }
 
 // New builds a Controller. It returns nil when passthrough is not usable, so
@@ -163,6 +203,17 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// Refuse before taking anything while a server-side automatic control is
+	// armed. Suspending them for the session would mean tracking what was
+	// suspended and restoring it across disconnects, crashes, and failed port
+	// reclamation; refusing keeps the state simple and honest.
+	if blocked := c.armedControls(); len(blocked) > 0 {
+		c.setupMu.Unlock()
+		log.Printf("raw passthrough refused %s: %s", remote, ErrAutomaticControlsArmed(blocked).Error())
+		_ = conn.Close()
+		return
+	}
+
 	// Refuse rather than interrupt an automatic transaction that is already
 	// driving the amplifier. Matches the coordinator's reject-don't-queue rule.
 	var lease transport.ActuationLease
@@ -193,11 +244,7 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 	c.mu.Unlock()
 	c.setupMu.Unlock()
 
-	if reason := handle.ProtectionUnavailableReason(); reason != "" {
-		log.Printf("raw passthrough %s: overtemperature protection is not engaged for this session: %s", remote, reason)
-	}
-
-	log.Printf("raw passthrough client %s connected; server polling paused", remote)
+	log.Printf("raw passthrough client %s connected; server polling paused and no server-side automatic control is available until it disconnects", remote)
 
 	var once sync.Once
 	done := make(chan struct{})
@@ -234,26 +281,6 @@ func (c *Controller) serve(ctx context.Context, conn net.Conn) {
 		select {
 		case <-ctx.Done():
 			log.Printf("raw passthrough disconnecting %s: server is shutting down", remote)
-			finish()
-		case <-done:
-		}
-	}()
-
-	// End the session when the tap says overtemperature control must be
-	// restored. Closing the socket unblocks both copies through their normal
-	// error paths; the server then reclaims the port and its own authorized
-	// safety path acts.
-	go func() {
-		select {
-		case reason, ok := <-handle.Trip():
-			if !ok {
-				return
-			}
-			c.mu.Lock()
-			c.lastTrip = &reason
-			c.lastTripAt = time.Now()
-			c.mu.Unlock()
-			log.Printf("raw passthrough disconnecting %s: %s (%.1fC >= %.1fC)", remote, reason.Reason, reason.TemperatureC, reason.ThresholdC)
 			finish()
 		case <-done:
 		}
@@ -329,20 +356,28 @@ func (c *Controller) closeActiveConn() {
 
 // Status describes the passthrough listener for the diagnostics API.
 type Status struct {
-	Enabled                  bool   `json:"enabled"`
-	ListenAddress            string `json:"listenAddress,omitempty"`
-	ClientConnected          bool   `json:"clientConnected"`
-	ClientAddress            string `json:"clientAddress,omitempty"`
-	ConnectedSince           string `json:"connectedSince,omitempty"`
-	StatusFramesObserved     int64  `json:"statusFramesObserved,omitempty"`
-	DisplayFramesObserved    int64  `json:"displayFramesObserved,omitempty"`
-	OvertemperatureProtected bool   `json:"overtemperatureProtected"`
-	ProtectionGapReason      string `json:"protectionGapReason,omitempty"`
-	LastTripReason           string `json:"lastTripReason,omitempty"`
-	LastTripTemperatureC     string `json:"lastTripTemperatureC,omitempty"`
-	LastTripAt               string `json:"lastTripAt,omitempty"`
-	LastTripInThisSession    bool   `json:"lastTripInThisSession,omitempty"`
-	Note                     string `json:"note,omitempty"`
+	Enabled               bool   `json:"enabled"`
+	ListenAddress         string `json:"listenAddress,omitempty"`
+	ClientConnected       bool   `json:"clientConnected"`
+	ClientAddress         string `json:"clientAddress,omitempty"`
+	ConnectedSince        string `json:"connectedSince,omitempty"`
+	StatusFramesObserved  int64  `json:"statusFramesObserved,omitempty"`
+	DisplayFramesObserved int64  `json:"displayFramesObserved,omitempty"`
+
+	// TapFresh reports whether tapped telemetry is currently being refreshed by
+	// the connected client. It is display freshness only and never implies that
+	// any server-side automatic control is available.
+	TapFresh bool `json:"tapFresh"`
+
+	// BlockedByArmedControls lists controls that must be disarmed before a
+	// session can start. Non-empty means a new client will be refused.
+	BlockedByArmedControls []string `json:"blockedByArmedControls,omitempty"`
+
+	// AutomaticControlsAvailable is always false during a session: the server
+	// emits no bytes of its own while the lease is held.
+	AutomaticControlsAvailable bool `json:"automaticControlsAvailable"`
+
+	Note string `json:"note,omitempty"`
 }
 
 // Status snapshots the listener state.
@@ -354,19 +389,15 @@ func (c *Controller) Status() Status {
 	conn := c.conn
 	handle := c.handle
 	since := c.since
-	lastTrip := c.lastTrip
-	lastTripAt := c.lastTripAt
 	c.mu.Unlock()
 
 	out := Status{Enabled: true, ListenAddress: c.cfg.ListenAddress}
-	if lastTrip != nil {
-		out.LastTripReason = lastTrip.Reason
-		out.LastTripTemperatureC = strconv.FormatFloat(lastTrip.TemperatureC, 'f', 1, 64)
-		out.LastTripAt = lastTripAt.UTC().Format(time.RFC3339)
-		// Without this an old trip reads as if it described the live session.
-		out.LastTripInThisSession = conn != nil && lastTripAt.After(since)
-	}
 	if conn == nil || handle == nil {
+		out.BlockedByArmedControls = c.armedControls()
+		if len(out.BlockedByArmedControls) > 0 {
+			out.Note = ErrAutomaticControlsArmed(out.BlockedByArmedControls).Error()
+			return out
+		}
 		out.Note = "no raw client connected; the server owns the serial port"
 		return out
 	}
@@ -376,12 +407,8 @@ func (c *Controller) Status() Status {
 	out.ConnectedSince = since.UTC().Format(time.RFC3339)
 	out.StatusFramesObserved = stats.StatusFramesSeen
 	out.DisplayFramesObserved = stats.DisplayFrames
-	out.OvertemperatureProtected = handle.OvertemperatureProtected()
-	out.ProtectionGapReason = handle.ProtectionUnavailableReason()
-	if out.OvertemperatureProtected {
-		out.Note = "a raw client holds the serial port; server writes are refused, and overtemperature protection is engaged through the passthrough tap"
-	} else {
-		out.Note = "a raw client holds the serial port and overtemperature protection is NOT engaged for this session"
-	}
+	out.TapFresh = handle.TapIsFresh()
+	out.Note = "a raw client holds the serial port; server writes are refused and no server-side automatic control is available for this session. " +
+		"Status shown from tapped traffic is labelled passthrough-tap and is display evidence only."
 	return out
 }

@@ -143,39 +143,37 @@ also holds an `ActuationCoordinator` lease under
 error before they reach the serial layer, and a passthrough session refuses to
 start while an automatic transaction is already driving the amplifier.
 
-**Overtemperature protection stays engaged.** The amplifier→client direction is
-tapped as it is forwarded: status frames are decoded with the same
-`StatusStreamDecoder` used in normal operation, so if the client polls `0x90`
-the server keeps receiving genuine `provenance: "status-poll"` telemetry at no
-extra cost on the wire. Tapped frames are deliberately **not** delivered to the
-safety, fan or menu-debug controllers — `monitoring.Controller.Observe` latches
-before attempting its toggle, so a tapped frame would spend its single no-retry
-attempt on a port it cannot reach. Instead the tap can only decide to **end the
-session**: on reaching the trip threshold it closes the TCP connection, the
-server reclaims the port, and the normal, fully authorized safety path acts on
-the next status reply with every existing gate satisfied. Display-derived
-temperature is never trusted to actuate, but is good enough to hand the port
-back so the authorized path can look for itself.
+**Automatic control is refused up front, not degraded.** A passthrough session
+cannot start while automatic fan control or overtemperature standby is armed.
+The listener asks `Config.ArmedAutomaticControls` before it takes either the
+coordinator lease or the serial port, and refuses with a `409`-carrying
+`AutomaticControlsArmedError` that names every control the operator must
+disarm. Nothing is silently suspended for the duration of a lease and nothing is
+automatically restored afterwards: tracking what was suspended and restoring it
+across disconnects, crashes and failed port reclamation is a second state
+machine, and refusal keeps the state simple and honest. An operator who chooses
+passthrough does so knowing those controls are unavailable.
 
-The trip is deliberately conditional. `applyStatusFrameFromSession` is the only
-caller of `monitoring.Controller.Observe`, so with status polling disabled the
-server could never act even after reclaiming the port — ending the session would
-take away the operator's live control link and put nothing in its place. So
-`evaluate` first checks `SerialSource.StatusPollingActive()` and declines to
-trip when reclaiming would not restore protection, reporting the gap instead.
-Display-derived trips additionally require a valid LCD checksum, because the
-display decoder validates only frame boundaries and this stream also carries
-replies to whatever the raw client sent.
+**Tapped telemetry is display evidence only.** The amplifier→client direction is
+decoded as it is forwarded, using the same `StatusStreamDecoder` as normal
+operation, so while the external client polls `0x90` the dashboard and API keep
+tracking the amplifier at no extra cost on the wire. Those frames are relabelled
+`provenance: "passthrough-tap"` before publication, because the amplifier
+answered a question the server did not ask.
 
-Because the safety controller takes a safety hold for the duration of an
-overtemperature excursion, a passthrough session is refused while that hold is
-active — after a thermal trip the port stays with the server until temperature
-falls back below the reset threshold.
+That label is the whole boundary. `StatusState.Resolve` merges tapped state for
+display and the provenance travels with the merged status, while fan policy
+(`fanpolicy.Evaluate`, `actionBlocks`) and overtemperature standby
+(`monitoring.Controller.Observe`) each test for `"status-poll"` exactly and so
+refuse it as authority. Tapped state goes stale normally when the client stops
+polling, and staleness is never dressed up as freshness. There is no byte
+injection, no response swallowing, and no command/reply correlation — those
+would make this a protocol proxy rather than a byte-stream lease.
 
-`GET /api/v1/raw-passthrough` reports whether a client is connected, whether
-protection is genuinely engaged, and `protectionGapReason` when it is not, plus
-the reason and temperature of the last trip. An operator is never left to infer
-safety that is not actually present.
+`GET /api/v1/raw-passthrough` reports whether a client is connected,
+`blockedByArmedControls` when a session would currently be refused, and
+`tapFresh` for display freshness. `automaticControlsAvailable` is always false
+during a session. An operator is never left to infer safety that is not present.
 
 ### `cmd/server`
 

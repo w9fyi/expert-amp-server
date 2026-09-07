@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/FtlC-ian/expert-amp-server/internal/api"
+	"github.com/FtlC-ian/expert-amp-server/internal/fanpolicy"
 	"github.com/FtlC-ian/expert-amp-server/internal/monitoring"
 	"github.com/FtlC-ian/expert-amp-server/internal/protocol"
 	"github.com/FtlC-ian/expert-amp-server/internal/serial"
@@ -172,11 +173,11 @@ func TestBeginRawPassthroughRejectsSecondClient(t *testing.T) {
 	}
 }
 
-// The tap must never hand frames to the safety controller: monitoring.Controller
-// latches before attempting its toggle, so a tapped frame would burn its single
-// no-retry attempt on a write that cannot succeed while the port is leased.
-// It signals a trip instead, so the session ends and the authorized path runs.
-func TestRawPassthroughTapTripsInsteadOfActuating(t *testing.T) {
+// A tapped frame is display evidence only. It must be labelled passthrough-tap,
+// must never reach the safety controller, and must never end the session -- the
+// operator keeps their live control link, and server-side automatic control was
+// already refused before the lease started.
+func TestRawPassthroughTapIsDisplayOnlyAndNeverActuates(t *testing.T) {
 	opener := &sequenceSerialOpener{
 		ports:  []serial.Port{&mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}},
 		opened: make(chan int, 3),
@@ -203,22 +204,75 @@ func TestRawPassthroughTapTripsInsteadOfActuating(t *testing.T) {
 	}
 	defer handle.Close()
 
+	// Well past the 50C trip threshold: under the old tap-and-drop behavior
+	// this ended the session.
 	handle.ObserveFromAmp(statusFrameAtTemperature(t, 80))
 
-	select {
-	case reason := <-handle.Trip():
-		if reason.TemperatureC < 50 {
-			t.Fatalf("unexpected trip temperature: %+v", reason)
-		}
-		if !reason.ProtocolNative {
-			t.Fatal("expected the trip to come from a protocol-native status frame")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("tap did not request the session end at the trip threshold")
+	if safety.Apply(monitoring.Result{}, true).Latched {
+		t.Fatal("tapped frames must not reach the safety controller")
 	}
 
+	tapped := src.statusState.CurrentProtocolNative()
+	if tapped.Provenance != ProvenancePassthroughTap {
+		t.Fatalf("tapped status provenance = %q, want %q", tapped.Provenance, ProvenancePassthroughTap)
+	}
+	if !handle.TapIsFresh() {
+		t.Fatal("tap should report fresh after observing a status frame")
+	}
+
+	// The session is still the operator's; nothing ended it.
+	if _, err := src.BeginRawPassthrough(context.Background()); !errors.Is(err, ErrRawPassthroughBusy) {
+		t.Fatalf("session should still be held after a hot tapped frame, got %v", err)
+	}
+}
+
+// The boundary this feature turns on: tapped status is visible to the display
+// path but is refused by every automatic actuation gate. Both gates test the
+// provenance string exactly, so this pins the string as much as the behavior.
+func TestPassthroughTapVisibleForDisplayRejectedForActuation(t *testing.T) {
+	hot := 80.0
+	tapped := api.Status{
+		Telemetry: api.Telemetry{
+			Provenance:     ProvenancePassthroughTap,
+			OperatingState: "operate",
+			TX:             new(bool),
+			TemperatureC:   &hot,
+			Source:         "serial",
+		},
+		RecentContact: true,
+	}
+
+	// Rejected as authority: overtemperature standby must not latch on it.
+	safety := monitoring.NewController(nil)
+	safety.Observe(context.Background(), tapped, monitoring.ControlSettings{
+		Enabled:    true,
+		Armed:      true,
+		Thresholds: monitoring.Thresholds{TemperatureTripC: 50, TemperatureWarningC: 40, TemperatureResetC: 40},
+	})
 	if safety.Apply(monitoring.Result{}, true).Latched {
-		t.Fatal("tapped frames must not reach the safety controller; its single no-retry attempt would be spent on an unreachable port")
+		t.Fatal("overtemperature standby latched on passthrough-tap status")
+	}
+
+	// Rejected as authority: fan policy must report it as unavailable.
+	fanResult := fanpolicy.Evaluate(tapped, fanpolicy.Settings{
+		Enabled:            true,
+		HighTemperatureC:   60,
+		NormalTemperatureC: 40,
+	}, fanpolicy.PolicyUnknown)
+	if fanResult.State != fanpolicy.StateUnavailable {
+		t.Fatalf("fan policy state = %q, want %q for passthrough-tap status", fanResult.State, fanpolicy.StateUnavailable)
+	}
+
+	// Visible for display: Resolve merges it and keeps the label attached, so a
+	// consumer can always tell what it is looking at.
+	state := NewStatusState(api.Status{})
+	state.UpdateProtocolNative(tapped)
+	resolved := state.Resolve(Snapshot{})
+	if resolved.Provenance != ProvenancePassthroughTap {
+		t.Fatalf("resolved provenance = %q, want the tap label to survive the merge", resolved.Provenance)
+	}
+	if resolved.TemperatureC == nil || *resolved.TemperatureC != hot {
+		t.Fatalf("tapped temperature was not merged for display: %+v", resolved.TemperatureC)
 	}
 }
 
@@ -269,24 +323,15 @@ func statusFrameAtTemperature(t *testing.T, temp int) []byte {
 	return out
 }
 
-// A trip is only worth taking if reclaiming the port restores protection.
-// applyStatusFrameFromSession is the sole caller of the safety controller, so
-// with status polling off the server could never act once it had the port back
-// -- dropping the client would remove the operator's live control link and put
-// nothing in its place.
-func TestRawPassthroughDoesNotTripWhenStatusPollingIsOff(t *testing.T) {
+// Tapped telemetry must go stale on its own when the client stops polling. The
+// guarantee cannot depend on any particular client's goodwill about how often
+// it asks for status.
+func TestRawPassthroughTapGoesStaleWhenClientStopsPolling(t *testing.T) {
 	opener := &sequenceSerialOpener{
 		ports:  []serial.Port{&mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}},
 		opened: make(chan int, 3),
 	}
-	src := newPassthroughTestSourceWithPolling(t, opener, "display", false)
-	src.ConfigureSafetyController(monitoring.NewController(nil), func() monitoring.ControlSettings {
-		return monitoring.ControlSettings{
-			Enabled:    true,
-			Armed:      true,
-			Thresholds: monitoring.Thresholds{TemperatureTripC: 50, TemperatureWarningC: 40, TemperatureResetC: 40},
-		}
-	})
+	src := newPassthroughTestSource(t, opener)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	src.Start(ctx)
@@ -299,20 +344,22 @@ func TestRawPassthroughDoesNotTripWhenStatusPollingIsOff(t *testing.T) {
 	}
 	defer handle.Close()
 
-	handle.ObserveFromAmp(statusFrameAtTemperature(t, 80))
-
-	select {
-	case reason := <-handle.Trip():
-		t.Fatalf("session was ended even though the server could not act afterwards: %+v", reason)
-	case <-time.After(500 * time.Millisecond):
+	if handle.TapIsFresh() {
+		t.Fatal("tap must not report fresh before any status frame is observed")
 	}
 
-	if handle.OvertemperatureProtected() {
-		t.Fatal("protection must not be reported as engaged when status polling is off")
+	handle.ObserveFromAmp(statusFrameAtTemperature(t, 40))
+	if !handle.TapIsFresh() {
+		t.Fatal("tap should report fresh immediately after a status frame")
 	}
-	reason := handle.ProtectionUnavailableReason()
-	if !strings.Contains(reason, "status polling is disabled") {
-		t.Fatalf("expected the status-polling gap to be reported, got %q", reason)
+
+	// Age the last observation past the contact window without waiting it out.
+	handle.mu.Lock()
+	handle.lastStatusAt = time.Now().Add(-2 * RecentContactWindow)
+	handle.mu.Unlock()
+
+	if handle.TapIsFresh() {
+		t.Fatal("tap must go stale once the client stops supplying status frames")
 	}
 }
 

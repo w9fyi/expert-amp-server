@@ -11,6 +11,7 @@ import (
 
 	"github.com/FtlC-ian/expert-amp-server/internal/api"
 	"github.com/FtlC-ian/expert-amp-server/internal/fanpolicy"
+	"github.com/FtlC-ian/expert-amp-server/internal/menudebug"
 	"github.com/FtlC-ian/expert-amp-server/internal/monitoring"
 	"github.com/FtlC-ian/expert-amp-server/internal/protocol"
 	"github.com/FtlC-ian/expert-amp-server/internal/serial"
@@ -445,5 +446,128 @@ func TestRawPassthroughRejectedClientKeepsFirstLease(t *testing.T) {
 
 	if _, err := coordinator.SendButton(context.Background(), api.ButtonAction{Name: "operate"}); transport.ButtonStatusCode(err) != 409 {
 		t.Fatalf("first client's lease was lost: expected 409 from the coordinator, got %v", err)
+	}
+}
+
+// currentPortGeneration reads the live session generation the way the read loop
+// stamps it, so a test can author a status frame that belongs to the real
+// session rather than inventing a generation.
+func currentPortGeneration(src *SerialSource) uint64 {
+	src.portMu.RLock()
+	defer src.portMu.RUnlock()
+	return src.portGeneration
+}
+
+// The menu-debug authorization boundary, which is the open verification question
+// on this feature: tapped telemetry must never become authority for server-side
+// actuation, including across a session transition.
+//
+// Fan policy and overtemperature standby each test the provenance string for
+// themselves, and TestPassthroughTapVisibleForDisplayRejectedForActuation pins
+// that. Menu debug does not test provenance at all. It is safe for two
+// structural reasons instead, and neither was pinned by a test: tapped frames
+// are never handed to its controller, and a new serial session invalidates the
+// evidence it already holds. Both are load-bearing, so both are asserted here --
+// if a later change routes tapped status into ObserveStatus, or drops the
+// session-generation invalidation, this fails rather than silently handing
+// display-only evidence to an actuation gate.
+func TestPassthroughTapNeverAuthorizesMenuDebugActuation(t *testing.T) {
+	opener := &sequenceSerialOpener{
+		ports:  []serial.Port{&mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}},
+		opened: make(chan int, 3),
+	}
+	src := newPassthroughTestSource(t, opener)
+
+	menuDebug := menudebug.NewController(nil)
+	src.ConfigureMenuDebugController(menuDebug)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	src.Start(ctx)
+	defer cancel()
+	waitForCondition(t, time.Second, func() bool { return opener.openCount() == 1 })
+
+	// Genuine pre-lease evidence, from the live session, by the production path.
+	// This is the only kind of status menu debug may ever act on.
+	preLeaseGeneration := currentPortGeneration(src)
+	src.applyStatusFrameFromSession(statusFrameAtTemperature(t, 30), preLeaseGeneration)
+
+	before := menuDebug.Runtime()
+	if before.Status.Provenance != "status-poll" {
+		t.Fatalf("pre-lease provenance = %q, want %q", before.Status.Provenance, "status-poll")
+	}
+	if before.StatusGeneration == 0 {
+		t.Fatal("pre-lease status evidence was not recorded, so the rest of this test would prove nothing")
+	}
+	if before.Status.ModelName == "" {
+		t.Fatal("pre-lease evidence carries no model, so no write could be authorized with it")
+	}
+
+	handle, err := src.BeginRawPassthrough(context.Background())
+	if err != nil {
+		t.Fatalf("BeginRawPassthrough error: %v", err)
+	}
+	defer handle.Close()
+
+	// A tapped frame the server never asked for, hot enough to trip protection
+	// and in a state that would otherwise satisfy the STANDBY/RX prerequisites.
+	handle.ObserveFromAmp(statusFrameAtTemperature(t, 80))
+
+	// It reaches the display path. That is the point of the tap.
+	if tapped := src.statusState.CurrentProtocolNative(); tapped.Provenance != ProvenancePassthroughTap {
+		t.Fatalf("tapped status provenance = %q, want %q", tapped.Provenance, ProvenancePassthroughTap)
+	}
+
+	// It must not reach menu debug, which would accept it on its face.
+	during := menuDebug.Runtime()
+	if during.Status.Provenance == ProvenancePassthroughTap {
+		t.Fatal("tapped status reached the menu-debug controller, which performs no provenance check of its own")
+	}
+	if during.StatusGeneration != before.StatusGeneration {
+		t.Fatalf("menu-debug status evidence advanced on tapped traffic: generation %d -> %d", before.StatusGeneration, during.StatusGeneration)
+	}
+	if during.Status.TemperatureC != nil && *during.Status.TemperatureC >= 80 {
+		t.Fatalf("tapped temperature became menu-debug evidence: %v", *during.Status.TemperatureC)
+	}
+
+	// The write path menu-debug actuation actually uses is the serial-session
+	// authorized one, not SendButton. It must refuse outright while the lease is
+	// held, and must not block behind the lease for the client's whole session.
+	authorization := transport.SerialSessionWriteAuthorization{
+		SessionGeneration: preLeaseGeneration,
+		Model:             before.Status.ModelName,
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, sendErr := src.SendButtonForSerialSession(context.Background(), api.ButtonAction{Name: "operate"}, authorization)
+		writeDone <- sendErr
+	}()
+	select {
+	case sendErr := <-writeDone:
+		if sendErr == nil {
+			t.Fatal("a serial-session authorized write succeeded while passthrough held the port")
+		}
+		if transport.ButtonStatusCode(sendErr) != 409 {
+			t.Fatalf("serial-session write: expected HTTP 409, got %d (%v)", transport.ButtonStatusCode(sendErr), sendErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serial-session authorized write blocked while a raw passthrough session held the port")
+	}
+
+	// The session transition. Closing the lease returns the port and reopens it
+	// as a new serial session, and that must invalidate the evidence menu debug
+	// was holding. Otherwise pre-lease status stays "recent" across a gap in
+	// which an external client had exclusive control of the amplifier.
+	handle.Close()
+	waitForCondition(t, 2*time.Second, func() bool { return opener.openCount() == 3 })
+	waitForCondition(t, 2*time.Second, func() bool {
+		return menuDebug.Runtime().SerialSessionGeneration > before.SerialSessionGeneration
+	})
+
+	after := menuDebug.Runtime()
+	if after.Status.RecentContact {
+		t.Fatal("menu-debug evidence still reads as recent contact after a passthrough session")
+	}
+	if !after.StatusObservedAt.IsZero() {
+		t.Fatalf("menu-debug status observation survived the session change: %v", after.StatusObservedAt)
 	}
 }

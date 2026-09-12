@@ -22,9 +22,15 @@ var ErrRawPassthroughUnavailable = errors.New("raw passthrough requires a config
 // ProvenancePassthroughTap marks status observed by copying another client's
 // traffic during a raw lease. It is deliberately distinct from "status-poll":
 // the amplifier answered a question the server did not ask, so the reply is
-// good enough to display but is never authority to actuate. Every automatic
-// actuation gate tests for "status-poll" exactly, so this value is refused by
-// fan policy, overtemperature standby, and menu debug without further work.
+// good enough to display but is never authority to actuate.
+//
+// Fan policy and overtemperature standby test for "status-poll" exactly, so
+// they refuse this value on sight. Menu debug does not test provenance at all;
+// it is protected structurally instead, by never being handed a tapped frame
+// and by having its retained evidence invalidated when the serial session
+// changes. Both halves of that are load-bearing, so both are pinned by
+// TestPassthroughTapNeverAuthorizesMenuDebugActuation rather than left to the
+// reader to notice.
 const ProvenancePassthroughTap = "passthrough-tap"
 
 // RawPassthroughHandle is one exclusive raw session over the physical serial
@@ -198,12 +204,22 @@ func (h *RawPassthroughHandle) Close() {
 // ObserveFromAmp decodes a chunk of the amplifier->client byte stream without
 // consuming or altering it. The caller still forwards the same bytes verbatim.
 //
-// This is display evidence only. Frames observed here are labelled
-// ProvenancePassthroughTap and are never delivered to the safety, fan or
-// menu-debug controllers, and never end the session. Server-side automatic
-// control is not degraded during a lease, it is refused up front: a session
-// cannot start while automatic fan control or overtemperature standby is armed
-// (see ArmedAutomaticControls), so there is no protection here to preserve.
+// This is display evidence only, and it never ends the session. Frames observed
+// here are labelled ProvenancePassthroughTap and published to statusState alone:
+// they are not fed to the controller fan-out in applyStatusFrameFromSession, so
+// they never become the evidence an actuation is authorized against.
+//
+// One path does hand a tapped status object to a controller, and it is worth
+// being precise about: once the tap goes stale, safetyContactLoop reports the
+// contact loss to fan policy, and the status it reads back carries this
+// provenance. That call exists to say the server has gone blind, it carries
+// RecentContact false, and fan policy refuses it on provenance as well. The
+// direction is fail-safe; nothing is authorized by it.
+//
+// Server-side automatic control is not degraded during a lease, it is refused up
+// front: a session cannot start while automatic fan control or overtemperature
+// standby is armed (see ArmedAutomaticControls), so there is no protection here
+// to preserve.
 func (h *RawPassthroughHandle) ObserveFromAmp(chunk []byte) {
 	if h == nil || len(chunk) == 0 || h.source == nil {
 		return

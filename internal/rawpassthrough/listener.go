@@ -373,8 +373,15 @@ type Status struct {
 	// session can start. Non-empty means a new client will be refused.
 	BlockedByArmedControls []string `json:"blockedByArmedControls,omitempty"`
 
-	// AutomaticControlsAvailable is always false during a session: the server
-	// emits no bytes of its own while the lease is held.
+	// AutomaticControlsAvailable reports whether the server owns the serial port
+	// and could therefore act on it. It is false for the lifetime of a lease,
+	// because the server emits no bytes of its own while a raw client holds the
+	// port, and true whenever no client is connected.
+	//
+	// It describes port ownership, not arming: true does not say that
+	// overtemperature standby or automatic fan control is enabled or armed, only
+	// that nothing is stopping them from acting. BlockedByArmedControls is what
+	// reports which controls are armed right now.
 	AutomaticControlsAvailable bool `json:"automaticControlsAvailable"`
 
 	Note string `json:"note,omitempty"`
@@ -393,6 +400,10 @@ func (c *Controller) Status() Status {
 
 	out := Status{Enabled: true, ListenAddress: c.cfg.ListenAddress}
 	if conn == nil || handle == nil {
+		// Idle, armed or not: the server still owns the port, so its automatic
+		// controls can act. Armed controls block the next client from taking the
+		// port; they do not stop the server from using it.
+		out.AutomaticControlsAvailable = true
 		out.BlockedByArmedControls = c.armedControls()
 		if len(out.BlockedByArmedControls) > 0 {
 			out.Note = ErrAutomaticControlsArmed(out.BlockedByArmedControls).Error()

@@ -315,6 +315,77 @@ func TestPassthroughAcceptsWhenNoAutomaticControlsAreArmed(t *testing.T) {
 	}
 }
 
+// automaticControlsAvailable reports whether the server owns the serial port.
+// It read false in every state, including while the listener sat idle and the
+// server held the port, which told an operator their automatic controls were
+// unavailable when nothing was stopping them. All three states are pinned here
+// because the field is only meaningful as a contrast between them.
+func TestAutomaticControlsAvailableTracksSerialPortOwnership(t *testing.T) {
+	controller, opener, cancel := newTestController(t)
+	defer cancel()
+
+	// The accept loop reads this while the test changes what it reports, so the
+	// value moves under a mutex and cfg itself is assigned once, before Start.
+	var armedMu sync.Mutex
+	var armedNow []string
+	setArmed := func(controls []string) {
+		armedMu.Lock()
+		defer armedMu.Unlock()
+		armedNow = controls
+	}
+	controller.cfg.ArmedAutomaticControls = func() []string {
+		armedMu.Lock()
+		defer armedMu.Unlock()
+		return armedNow
+	}
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	addr := startListener(t, ctx, controller)
+
+	// Idle: no client, nothing armed. The server owns the port and can act.
+	setArmed(nil)
+	status := controller.Status()
+	if !status.AutomaticControlsAvailable {
+		t.Fatalf("idle listener reports automatic controls unavailable: %+v", status)
+	}
+	if status.ClientConnected {
+		t.Fatalf("expected no client connected while idle: %+v", status)
+	}
+
+	// Armed-idle: controls armed and no client. Still available -- armed controls
+	// block the next client from taking the port, they do not stop the server
+	// from using it. This is the state an operator checks before connecting.
+	armed := []string{"automatic fan control", "overtemperature standby"}
+	setArmed(armed)
+	status = controller.Status()
+	if !status.AutomaticControlsAvailable {
+		t.Fatalf("armed-idle listener reports automatic controls unavailable: %+v", status)
+	}
+	if len(status.BlockedByArmedControls) != len(armed) {
+		t.Fatalf("armed-idle blockedByArmedControls = %v, want %v", status.BlockedByArmedControls, armed)
+	}
+
+	// Connected: the lease is held, the server emits no bytes of its own, so its
+	// automatic controls genuinely cannot act.
+	setArmed(nil)
+	baseline := opener.count()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	opener.waitForNewPort(t, baseline)
+
+	status = controller.Status()
+	if !status.ClientConnected {
+		t.Fatalf("expected a connected client: %+v", status)
+	}
+	if status.AutomaticControlsAvailable {
+		t.Fatalf("automatic controls reported available while a client holds the lease: %+v", status)
+	}
+}
+
 func TestNewReturnsNilWhenDisabled(t *testing.T) {
 	if c := New(Config{Enabled: false, ListenAddress: ":7388"}); c != nil {
 		t.Fatal("expected nil controller when passthrough is disabled")

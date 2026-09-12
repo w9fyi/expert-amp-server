@@ -571,3 +571,169 @@ func TestPassthroughTapNeverAuthorizesMenuDebugActuation(t *testing.T) {
 		t.Fatalf("menu-debug status observation survived the session change: %v", after.StatusObservedAt)
 	}
 }
+
+// displaySnapshot is what the display path has to offer Resolve: telemetry
+// decoded from display frames, with no protocol-native fields of its own.
+func displaySnapshot(band string, updatedAt time.Time) Snapshot {
+	return Snapshot{
+		Telemetry: api.Telemetry{
+			Band:           band,
+			OperatingState: "operate",
+			Source:         "serial",
+			Confidence:     "display-derived",
+			Provenance:     "display-frame",
+		},
+		UpdatedAt: updatedAt,
+	}
+}
+
+// A lease stops the server's own polling, so the status-poll frame it was
+// holding stops being evidence of anything current. Serving it anyway is how
+// /api/v1/status and /api/v1/alarms came to report pre-lease temperature, SWR,
+// TX and output level as "status-poll" with recentContact true -- for a client
+// that may never ask the amplifier for status at all, which is exactly what SPE
+// Expert Controller Plus does.
+//
+// The window is what makes this worth pinning: a lease can begin within
+// RecentContactWindow of the last poll, so waiting for the retained frame to age
+// out is not the same as dropping it, and the display-only case never ages into
+// correctness at all -- it stays wrong for the life of the lease.
+func TestPassthroughLeaseStopsServingPreLeaseStatusAsCanonical(t *testing.T) {
+	opener := &sequenceSerialOpener{
+		ports:  []serial.Port{&mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}},
+		opened: make(chan int, 3),
+	}
+	src := newPassthroughTestSource(t, opener)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	src.Start(ctx)
+	defer cancel()
+	waitForCondition(t, time.Second, func() bool { return opener.openCount() == 1 })
+
+	// A real poll reply, seconds old at most: canonical status is entitled to
+	// report it, and does. Without this the rest of the test proves nothing.
+	src.applyStatusFrame(statusFrameAtTemperature(t, 40))
+	before := src.statusState.Resolve(displaySnapshot("20m", time.Now().UTC()))
+	if before.Provenance != "status-poll" {
+		t.Fatalf("pre-lease provenance = %q, want status-poll", before.Provenance)
+	}
+	if before.TemperatureC == nil || *before.TemperatureC != 40 {
+		t.Fatalf("pre-lease temperature = %v, want the polled 40", before.TemperatureC)
+	}
+	if !before.RecentContact {
+		t.Fatal("pre-lease status does not report recent contact, so this test cannot show the lease changing that")
+	}
+
+	handle, err := src.BeginRawPassthrough(context.Background())
+	if err != nil {
+		t.Fatalf("BeginRawPassthrough error: %v", err)
+	}
+
+	// Immediately, with the polled frame still inside its contact window.
+	atLeaseStart := src.statusState.Resolve(Snapshot{})
+	if atLeaseStart.Provenance == "status-poll" {
+		t.Fatal("canonical status still claims status-poll provenance after the server stopped polling")
+	}
+	if atLeaseStart.TemperatureC != nil {
+		t.Fatalf("pre-lease temperature %v is still being served as canonical during the lease", *atLeaseStart.TemperatureC)
+	}
+	if atLeaseStart.RecentContact {
+		t.Fatal("canonical status reports recent contact for a reading nothing is refreshing")
+	}
+
+	// A display-only client: display frames flow, no 0x90 is ever sent. The tap
+	// must still be working, or the assertions below would pass for the wrong
+	// reason.
+	handle.ObserveFromAmp(displayStreamChunk(t))
+	stats := handle.Stats()
+	if stats.DisplayFrames == 0 {
+		t.Fatal("no display frames were tapped, so this is not the display-only case")
+	}
+	if stats.StatusFramesSeen != 0 {
+		t.Fatalf("statusFramesSeen = %d, want 0 for a client that never polls status", stats.StatusFramesSeen)
+	}
+	if handle.TapIsFresh() {
+		t.Fatal("tap reports fresh without a single tapped status frame")
+	}
+
+	// Display state changes during the lease and canonical status follows it --
+	// display contact is real contact, so recentContact true here is honest. What
+	// must not come back are the protocol-only fields.
+	duringLease := src.statusState.Resolve(displaySnapshot("40m", time.Now().UTC()))
+	if duringLease.Band != "40m" {
+		t.Fatalf("band = %q, want the display change to be reflected during the lease", duringLease.Band)
+	}
+	if duringLease.Provenance != "display-frame" {
+		t.Fatalf("provenance = %q, want display-frame while only the display is being tapped", duringLease.Provenance)
+	}
+	if duringLease.TemperatureC != nil || duringLease.TX != nil {
+		t.Fatalf("protocol-only fields returned during a display-only lease: temp=%v tx=%v", duringLease.TemperatureC, duringLease.TX)
+	}
+
+	// Disconnect. The port comes back but the first new poll reply has not
+	// arrived yet, and the pre-lease frame is no more current now than it was
+	// during the lease -- an external client had exclusive control in between.
+	handle.Close()
+	waitForCondition(t, 2*time.Second, func() bool { return opener.openCount() >= 3 })
+
+	afterClose := src.statusState.Resolve(displaySnapshot("40m", time.Now().UTC()))
+	if afterClose.Provenance == "status-poll" || afterClose.TemperatureC != nil {
+		t.Fatalf("pre-lease status came back after disconnect, before any new poll reply: %+v", afterClose)
+	}
+
+	// The first poll reply after the lease restores canonical status on its own.
+	// Nothing had to be restored by the teardown path.
+	src.applyStatusFrame(statusFrameAtTemperature(t, 41))
+	recovered := src.statusState.Resolve(displaySnapshot("40m", time.Now().UTC()))
+	if recovered.Provenance != "status-poll" {
+		t.Fatalf("provenance = %q, want status-poll once polling resumes", recovered.Provenance)
+	}
+	if recovered.TemperatureC == nil || *recovered.TemperatureC != 41 {
+		t.Fatalf("temperature = %v, want the newly polled 41", recovered.TemperatureC)
+	}
+	if !recovered.RecentContact {
+		t.Fatal("canonical status does not report recent contact after a fresh poll reply")
+	}
+}
+
+// The other way out of the invalidated state: a client that does poll 0x90.
+// Its replies are tapped, labelled passthrough-tap, and are good enough to
+// display -- so canonical status comes back on the tapped frame, still carrying
+// the label that every actuation gate refuses.
+func TestPassthroughTappedStatusRestoresCanonicalStatusDuringLease(t *testing.T) {
+	opener := &sequenceSerialOpener{
+		ports:  []serial.Port{&mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}, &mockSerialPort{blockRead: true}},
+		opened: make(chan int, 3),
+	}
+	src := newPassthroughTestSource(t, opener)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	src.Start(ctx)
+	defer cancel()
+	waitForCondition(t, time.Second, func() bool { return opener.openCount() == 1 })
+
+	src.applyStatusFrame(statusFrameAtTemperature(t, 40))
+
+	handle, err := src.BeginRawPassthrough(context.Background())
+	if err != nil {
+		t.Fatalf("BeginRawPassthrough error: %v", err)
+	}
+	defer handle.Close()
+
+	if resolved := src.statusState.Resolve(Snapshot{}); resolved.TemperatureC != nil {
+		t.Fatalf("pre-lease temperature %v survived the start of the lease", *resolved.TemperatureC)
+	}
+
+	handle.ObserveFromAmp(statusFrameAtTemperature(t, 80))
+
+	resolved := src.statusState.Resolve(displaySnapshot("20m", time.Now().UTC()))
+	if resolved.Provenance != ProvenancePassthroughTap {
+		t.Fatalf("provenance = %q, want %q once the client's own poll reply is tapped", resolved.Provenance, ProvenancePassthroughTap)
+	}
+	if resolved.TemperatureC == nil || *resolved.TemperatureC != 80 {
+		t.Fatalf("temperature = %v, want the tapped 80", resolved.TemperatureC)
+	}
+	if !resolved.RecentContact {
+		t.Fatal("a just-tapped status frame does not report recent contact")
+	}
+}

@@ -462,8 +462,9 @@ func NewHandler(opts Options) http.Handler {
 		}
 		if opts.RawPassthrough == nil {
 			writeAPI(w, http.StatusOK, api.Response{Success: true, Data: rawpassthrough.Status{
-				Enabled: false,
-				Note:    "raw serial passthrough is disabled; the server owns the serial port",
+				Enabled:                    false,
+				AutomaticControlsAvailable: true,
+				Note:                       "raw serial passthrough is disabled; the server owns the serial port",
 			}})
 			return
 		}

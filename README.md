@@ -81,11 +81,15 @@ resumes automatically. A second concurrent client is rejected.
 
 **Server-side automatic controls are unavailable during a session, and a session
 is refused rather than started while one is armed.** If automatic fan control or
-overtemperature standby is armed, a connecting client is refused with a `409`
-that names each control to disarm. Nothing is silently suspended and nothing is
-automatically restored afterwards — choosing passthrough means knowingly running
-without those controls for as long as the client is connected. The amplifier's
-own firmware stepdown is unaffected.
+overtemperature standby is armed, a connecting client is refused: the server
+closes the connection without sending a byte, so the client sees a clean EOF (or
+`ECONNRESET` if it wrote first) and some clients show only a retry spinner. The
+reason is not delivered on the raw socket — that socket carries the amplifier's
+stream and nothing else. Read it from the server log or
+`GET /api/v1/raw-passthrough`, which names each control to disarm. Nothing is
+silently suspended and nothing is automatically restored afterwards — choosing
+passthrough means knowingly running without those controls for as long as the
+client is connected. The amplifier's own firmware stepdown is unaffected.
 
 The dashboard and API keep working meanwhile: the server passively decodes the
 amplifier→client direction as it forwards it, so while the external client polls
@@ -94,9 +98,19 @@ status, telemetry keeps updating. That state is labelled
 when the client stops polling, and is never accepted as authority to actuate the
 amplifier. The server injects no bytes of its own while the lease is held.
 
+A client that never polls `0x90` is normal — SPE Expert Controller Plus reads
+the display and nothing else. In that case there is no tapped status to show, so
+canonical status reports display-derived state alone for the session: the
+pre-lease status-poll reading is dropped as the lease begins rather than served
+as though something were still refreshing it. Protocol-only fields such as
+temperature, SWR, TX and output level are simply absent until the server polls
+again after the client disconnects.
+
 Check `GET /api/v1/raw-passthrough`: it reports `blockedByArmedControls` when a
 session would be refused, `tapFresh` for display freshness, and
-`automaticControlsAvailable`, which is always false during a session.
+`automaticControlsAvailable`, which reports whether the server owns the serial
+port — false for the lifetime of a lease, true when no client is connected. It
+does not report whether a control is armed; `blockedByArmedControls` does that.
 
 ## API highlights
 

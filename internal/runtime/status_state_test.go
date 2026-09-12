@@ -432,6 +432,76 @@ func TestStatusStateKeepsProtocolValuesWhenDisplaySnapshotIsNotNewer(t *testing.
 	}
 }
 
+// The invalidation is generational, not time-based, and it lifts on the next
+// published frame whatever that frame says. The repeat case is the subtle one:
+// an amplifier sitting in a steady state answers every poll with identical
+// bytes, so counting only changed frames would strand canonical status in the
+// invalidated state for as long as nothing moved.
+func TestStatusStateInvalidationLiftsOnTheNextPublishedFrameEvenIfUnchanged(t *testing.T) {
+	polled := api.Status{Telemetry: api.Telemetry{
+		OperatingState: "operate",
+		TemperatureC:   floatPtr(42),
+		Source:         "serial",
+		Confidence:     "protocol-native",
+		Provenance:     "status-poll",
+	}}
+	display := Snapshot{
+		Telemetry: api.Telemetry{
+			Band:       "20m",
+			Source:     "serial",
+			Confidence: "display-derived",
+			Provenance: "display-frame",
+		},
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	state := NewStatusState(api.Status{})
+	state.UpdateProtocolNative(polled)
+	if resolved := state.Resolve(display); resolved.Provenance != "status-poll" {
+		t.Fatalf("provenance = %q, want status-poll before any invalidation", resolved.Provenance)
+	}
+
+	state.InvalidatePreLeaseStatus()
+	invalidated := state.Resolve(display)
+	if invalidated.Provenance != "display-frame" || invalidated.TemperatureC != nil {
+		t.Fatalf("invalidated status still carries the protocol frame: %+v", invalidated)
+	}
+	if invalidated.Band != "20m" {
+		t.Fatalf("band = %q, want display-derived state to survive invalidation", invalidated.Band)
+	}
+
+	// Byte-identical to the frame that was invalidated: still fresh evidence.
+	state.UpdateProtocolNative(polled)
+	recovered := state.Resolve(display)
+	if recovered.Provenance != "status-poll" {
+		t.Fatalf("provenance = %q, want status-poll after an unchanged frame is republished", recovered.Provenance)
+	}
+	if recovered.TemperatureC == nil || *recovered.TemperatureC != 42 {
+		t.Fatalf("temperature = %v, want 42 restored by the repeat frame", recovered.TemperatureC)
+	}
+
+	// Repeated invalidation without an intervening frame stays invalidated
+	// rather than tripping over itself.
+	state.InvalidatePreLeaseStatus()
+	state.InvalidatePreLeaseStatus()
+	if resolved := state.Resolve(display); resolved.Provenance != "display-frame" {
+		t.Fatalf("provenance = %q, want display-frame while still invalidated", resolved.Provenance)
+	}
+}
+
+// A status state that has never had a lease must behave exactly as before,
+// including the seed value passed to NewStatusState.
+func TestStatusStateSeedIsCanonicalUntilSomethingInvalidatesIt(t *testing.T) {
+	seeded := NewStatusState(api.Status{Telemetry: api.Telemetry{
+		ModelName:  "EXPERT 2K-FA",
+		Provenance: "status-poll",
+	}})
+
+	if resolved := seeded.Resolve(Snapshot{}); resolved.ModelName != "EXPERT 2K-FA" {
+		t.Fatalf("seeded status was not resolved: %+v", resolved)
+	}
+}
+
 func floatPtr(v float64) *float64 {
 	return &v
 }

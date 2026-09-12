@@ -146,9 +146,15 @@ start while an automatic transaction is already driving the amplifier.
 **Automatic control is refused up front, not degraded.** A passthrough session
 cannot start while automatic fan control or overtemperature standby is armed.
 The listener asks `Config.ArmedAutomaticControls` before it takes either the
-coordinator lease or the serial port, and refuses with a `409`-carrying
-`AutomaticControlsArmedError` that names every control the operator must
-disarm. Nothing is silently suspended for the duration of a lease and nothing is
+coordinator lease or the serial port, and refuses the connection by closing it
+without writing a byte. The raw socket carries the amplifier's stream and
+nothing else, so the refusal reason never travels on it: the client sees a
+clean EOF, or `ECONNRESET` if it wrote first. The reason reaches the operator
+through the server log and `GET /api/v1/raw-passthrough`, which reports it in
+`blockedByArmedControls` and `note` from the same `AutomaticControlsArmedError`
+that names every control to disarm. (That error's 409 is for HTTP callers of the
+button and wake routes — a raw TCP client is never handed an HTTP status.)
+Nothing is silently suspended for the duration of a lease and nothing is
 automatically restored afterwards: tracking what was suspended and restoring it
 across disconnects, crashes and failed port reclamation is a second state
 machine, and refusal keeps the state simple and honest. An operator who chooses
@@ -170,10 +176,28 @@ polling, and staleness is never dressed up as freshness. There is no byte
 injection, no response swallowing, and no command/reply correlation — those
 would make this a protocol proxy rather than a byte-stream lease.
 
+**The pre-lease status frame is invalidated as the lease begins.** A lease stops
+the server's own polling, so `BeginRawPassthrough` calls
+`StatusState.InvalidatePreLeaseStatus`: the retained `status-poll` frame stops
+being canonical immediately, rather than aging out of its five-second contact
+window. Without that, a client that forwards display frames but never asks for
+`0x90` — which is what SPE Expert Controller Plus actually does — would leave
+`/api/v1/status` and `/api/v1/alarms` serving pre-lease temperature, SWR, TX and
+output level labelled `status-poll` with `recentContact: true`, for a reading
+nothing was refreshing. Canonical status falls back to display-derived state
+until a tapped `0x90` or the first poll after the lease supersedes it; the
+invalidation lifts itself on the next published frame, so nothing has to be
+restored on disconnect. The internal gates never depended on this — they test
+provenance and contact themselves — so this is an API-honesty fix, not a safety
+one.
+
 `GET /api/v1/raw-passthrough` reports whether a client is connected,
 `blockedByArmedControls` when a session would currently be refused, and
-`tapFresh` for display freshness. `automaticControlsAvailable` is always false
-during a session. An operator is never left to infer safety that is not present.
+`tapFresh` for display freshness. `automaticControlsAvailable` reports serial
+port ownership: false for the lifetime of a lease, true whenever no client holds
+the port. It is not a statement that any control is armed —
+`blockedByArmedControls` is what reports that. An operator is never left to infer
+safety that is not present.
 
 ### `cmd/server`
 

@@ -92,8 +92,10 @@ type Settings struct {
 	// Raw serial-over-TCP passthrough hands the physical port to a single
 	// external client (for example SPE Expert Controller) for the lifetime of
 	// one TCP connection. Disabled by default: while a client is connected the
-	// server cannot issue button writes, and overtemperature protection depends
-	// on the passthrough tap rather than on its own polling.
+	// server cannot issue button writes, and no server-side automatic control is
+	// available for the session. Overtemperature protection never runs on tapped
+	// telemetry -- a session is refused outright while that protection or
+	// automatic fan control is armed.
 	RawPassthroughEnabled       bool   `json:"rawPassthroughEnabled"`
 	RawPassthroughListenAddress string `json:"rawPassthroughListenAddress,omitempty"`
 }

@@ -150,6 +150,12 @@ func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthrough
 	}
 
 	s.rawPassthroughActive = true
+	// The server's own polling stops here, so whatever status-poll frame is
+	// retained stops being evidence of current contact -- however recently it
+	// arrived. Canonical status falls back to display-derived state until a
+	// tapped 0x90 or the first poll after the lease supersedes it. The read loop
+	// is already retired, so no poll can land between this and the flag above.
+	s.statusState.InvalidatePreLeaseStatus()
 	s.writeMu.Unlock()
 	// lifecycleMu stays held until Close: it is what keeps readLoop parked.
 

@@ -18,12 +18,14 @@ import (
 	"time"
 
 	"github.com/FtlC-ian/expert-amp-server/internal/api"
+	"github.com/FtlC-ian/expert-amp-server/internal/apidocs"
 	"github.com/FtlC-ian/expert-amp-server/internal/config"
 	"github.com/FtlC-ian/expert-amp-server/internal/display"
 	"github.com/FtlC-ian/expert-amp-server/internal/fanpolicy"
 	"github.com/FtlC-ian/expert-amp-server/internal/font"
 	"github.com/FtlC-ian/expert-amp-server/internal/menudebug"
 	"github.com/FtlC-ian/expert-amp-server/internal/monitoring"
+	"github.com/FtlC-ian/expert-amp-server/internal/rawpassthrough"
 	"github.com/FtlC-ian/expert-amp-server/internal/runtime"
 	"github.com/FtlC-ian/expert-amp-server/internal/serial"
 	"github.com/FtlC-ian/expert-amp-server/internal/transport"
@@ -2893,6 +2895,134 @@ func TestV1AlarmsEndpointUsesCanonicalStatusAndConfiguredMonitoring(t *testing.T
 	}
 }
 
+// A raw passthrough lease stops the server's own polling, and
+// BeginRawPassthrough invalidates the status-poll frame it was holding. These
+// are the two endpoints that were serving that frame afterwards: /api/v1/status
+// reported pre-lease protocol-only fields as status-poll, and /api/v1/alarms
+// went further and evaluated the stale temperature against live thresholds.
+// Neither may outlive the lease start.
+func TestV1StatusAndAlarmsStopServingPreLeaseReadingDuringPassthrough(t *testing.T) {
+	// Display frames keep flowing during a lease, so the snapshot stays current.
+	// That makes this the harder case: display contact is genuinely recent, and
+	// only the protocol-only fields have gone stale.
+	store := runtime.NewStore(runtime.Snapshot{
+		Telemetry: api.Telemetry{
+			Band:           "20m",
+			OperatingState: "operate",
+			Source:         "serial",
+			Confidence:     "display-derived",
+			Provenance:     "display-frame",
+		},
+		Source:    "serial",
+		UpdatedAt: time.Now().UTC(),
+	})
+
+	statusState := runtime.NewStatusState(api.Status{})
+	temp := 75.0
+	tx := false
+	statusState.UpdateProtocolNative(api.Status{
+		Telemetry: api.Telemetry{
+			TemperatureC: &temp,
+			TX:           &tx,
+			OutputLevel:  "HIGH",
+			Source:       "serial",
+			Confidence:   "protocol-native",
+			Provenance:   "status-poll",
+		},
+	})
+
+	mgr, err := config.NewManager(filepath.Join(t.TempDir(), "expert-amp-server.json"), ":8088")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if _, err := mgr.Update(config.Settings{
+		PollingMode:             string(config.PollingModeBoth),
+		SafetyMonitoringEnabled: true,
+		TemperatureWarningC:     70,
+		TemperatureTripC:        80,
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	handler := NewHandler(Options{
+		IndexHTML:   []byte("ok"),
+		DocsHTML:    []byte("<html>docs</html>"),
+		OpenAPIJSON: []byte(`{"openapi":"3.0.3"}`),
+		ROM:         font.Builtin(),
+		Store:       store,
+		StatusState: statusState,
+		Config:      mgr,
+		DemoState:   display.DemoState(),
+		AltState:    display.DemoStateAlt(),
+	})
+
+	getStatus := func(t *testing.T) api.Status {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status code = %d, want %d", rec.Code, http.StatusOK)
+		}
+		var body struct {
+			Success bool       `json:"success"`
+			Data    api.Status `json:"data"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+			t.Fatalf("decode status response: %v", err)
+		}
+		return body.Data
+	}
+	getAlarms := func(t *testing.T) alarmsResponse {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/alarms", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("alarms code = %d, want %d", rec.Code, http.StatusOK)
+		}
+		var body struct {
+			Success bool           `json:"success"`
+			Data    alarmsResponse `json:"data"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+			t.Fatalf("decode alarms response: %v", err)
+		}
+		return body.Data
+	}
+
+	// Before the lease both endpoints are entitled to the polled reading, and the
+	// alarms endpoint really is evaluating it: 75C against a 70C warning.
+	if status := getStatus(t); status.TemperatureC == nil || *status.TemperatureC != 75 || status.Provenance != "status-poll" {
+		t.Fatalf("pre-lease status did not serve the polled reading: %+v", status)
+	}
+	if alarms := getAlarms(t); alarms.Monitor.State != monitoring.StateWarning {
+		t.Fatalf("pre-lease monitor state = %q, want %q -- the stale reading must be shown to matter before the lease", alarms.Monitor.State, monitoring.StateWarning)
+	}
+
+	// The lease begins. This is the call BeginRawPassthrough makes.
+	statusState.InvalidatePreLeaseStatus()
+
+	status := getStatus(t)
+	if status.Provenance == "status-poll" {
+		t.Fatal("/api/v1/status still labels canonical status status-poll while a lease holds the port")
+	}
+	if status.TemperatureC != nil || status.TX != nil || status.OutputLevel != "" {
+		t.Fatalf("/api/v1/status still serves pre-lease protocol-only fields: temp=%v tx=%v outputLevel=%q", status.TemperatureC, status.TX, status.OutputLevel)
+	}
+	if status.Band != "20m" {
+		t.Fatalf("band = %q, want display-derived state to keep working during the lease", status.Band)
+	}
+
+	alarms := getAlarms(t)
+	if alarms.Monitor.State == monitoring.StateWarning || alarms.Monitor.State == monitoring.StateTrip {
+		t.Fatalf("/api/v1/alarms evaluated a pre-lease temperature against live thresholds: %+v", alarms.Monitor)
+	}
+	if alarms.Monitor.Observations.MaximumTemperatureC != nil {
+		t.Fatalf("alarms still observes a pre-lease temperature: %v", *alarms.Monitor.Observations.MaximumTemperatureC)
+	}
+}
+
 func TestV1AlarmsReportsPreviouslyRequestedStandbyWithoutActuatingFromGET(t *testing.T) {
 	temp := 46.0
 	tx := false
@@ -3529,6 +3659,116 @@ func TestOpenAPIDocumentEndpointServesJSON(t *testing.T) {
 	}
 	if body := rec.Body.String(); !strings.Contains(body, `"openapi":"3.0.3"`) {
 		t.Fatalf("unexpected body: %q", body)
+	}
+}
+
+// The passthrough surface was reachable but undocumented: the served contract
+// described neither the endpoint nor the two settings that turn it on, so an
+// integrator reading the spec could not find it at all. This asserts against
+// the real embedded document, not the stub the other tests serve, and checks
+// the handler's own output against the schema that now documents it.
+func TestRawPassthroughEndpointIsServedAndDocumented(t *testing.T) {
+	store := runtime.NewStore(runtime.Snapshot{})
+	handler := NewHandler(Options{
+		IndexHTML:   []byte("ok"),
+		DocsHTML:    []byte("<html>docs</html>"),
+		OpenAPIJSON: apidocs.MustOpenAPIJSON(),
+		ROM:         font.Builtin(),
+		Store:       store,
+		StatusState: runtime.NewStatusState(api.Status{}),
+		DemoState:   display.DemoState(),
+		AltState:    display.DemoStateAlt(),
+		// RawPassthrough stays nil: the disabled path is the one every install
+		// serves by default, and it is the one that reported the server as
+		// unable to run its own automatic controls.
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.json", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("openapi status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var spec struct {
+		Paths      map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]json.RawMessage `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &spec); err != nil {
+		t.Fatalf("decode served openapi document: %v", err)
+	}
+
+	if _, ok := spec.Paths["/api/v1/raw-passthrough"]; !ok {
+		t.Fatal("the served OpenAPI document does not describe /api/v1/raw-passthrough")
+	}
+	for _, schema := range []string{"Settings", "SettingsUpdateRequest"} {
+		properties := spec.Components.Schemas[schema].Properties
+		for _, field := range []string{"rawPassthroughEnabled", "rawPassthroughListenAddress"} {
+			if _, ok := properties[field]; !ok {
+				t.Fatalf("%s schema does not document %s", schema, field)
+			}
+		}
+	}
+
+	documented := spec.Components.Schemas["RawPassthrough"].Properties
+	if len(documented) == 0 {
+		t.Fatal("the served OpenAPI document has no RawPassthrough schema")
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/raw-passthrough", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("raw-passthrough status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	payload := rec.Body.Bytes()
+	var body struct {
+		Success bool                       `json:"success"`
+		Data    map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("decode raw-passthrough response: %v", err)
+	}
+	if !body.Success {
+		t.Fatalf("success = false, want true: %v", body)
+	}
+
+	// Every field the handler actually emits has to be in the schema, or the
+	// document is describing something other than what is served.
+	for field := range body.Data {
+		if _, ok := documented[field]; !ok {
+			t.Fatalf("handler returned undocumented field %q", field)
+		}
+	}
+	for _, required := range []string{"enabled", "clientConnected", "tapFresh", "automaticControlsAvailable"} {
+		if _, ok := body.Data[required]; !ok {
+			t.Fatalf("response omits %q, which the schema marks required", required)
+		}
+	}
+
+	var disabled rawpassthrough.Status
+	if err := json.Unmarshal(payload, &struct {
+		Data *rawpassthrough.Status `json:"data"`
+	}{Data: &disabled}); err != nil {
+		t.Fatalf("decode raw-passthrough data: %v", err)
+	}
+	if disabled.Enabled {
+		t.Fatal("enabled = true with no passthrough controller configured")
+	}
+	if !disabled.AutomaticControlsAvailable {
+		t.Fatal("automaticControlsAvailable = false while passthrough is disabled and the server owns the port")
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/raw-passthrough", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status = %d, want %d for a read-only endpoint", rec.Code, http.StatusMethodNotAllowed)
 	}
 }
 

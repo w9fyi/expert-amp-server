@@ -15,15 +15,23 @@ type StatusState struct {
 	mu             sync.RWMutex
 	protocolNative api.Status
 	lastProtocolAt time.Time
-	subscribers    map[chan api.Status]struct{}
+
+	// protocolGeneration counts published protocol-native frames. It starts at 1
+	// so the seed status counts as a generation and the zero value of
+	// invalidBeforeGeneration means "nothing has been invalidated yet".
+	protocolGeneration      uint64
+	invalidBeforeGeneration uint64
+
+	subscribers map[chan api.Status]struct{}
 }
 
 const RecentContactWindow = 5 * time.Second
 
 func NewStatusState(initial api.Status) *StatusState {
 	return &StatusState{
-		protocolNative: initial,
-		subscribers:    make(map[chan api.Status]struct{}),
+		protocolNative:     initial,
+		protocolGeneration: 1,
+		subscribers:        make(map[chan api.Status]struct{}),
 	}
 }
 
@@ -60,6 +68,9 @@ func (s *StatusState) UpdateProtocolNative(status api.Status) {
 	changed := !reflect.DeepEqual(s.protocolNative, status)
 	s.protocolNative = status
 	s.lastProtocolAt = now
+	// Counts every publication, not only changed ones: an unchanged repeat is
+	// still fresh evidence, and is what lifts a passthrough invalidation.
+	s.protocolGeneration++
 	subscribers := make([]chan api.Status, 0, len(s.subscribers))
 	if changed {
 		for ch := range s.subscribers {
@@ -105,13 +116,50 @@ func (s *StatusState) Subscribe(buffer int) (<-chan api.Status, func()) {
 	return ch, unsubscribe
 }
 
+// InvalidatePreLeaseStatus marks the retained protocol-native status as no
+// longer canonical. Raw passthrough calls it as a lease begins, because the
+// lease stops the server's own polling: without it the last pre-lease
+// status-poll frame keeps both its "status-poll" label and its freshness
+// window, so /api/v1/status and /api/v1/alarms would report protocol-only
+// fields -- temperature, SWR, TX, output level -- as current on behalf of a
+// client that may never ask the amplifier for status at all.
+//
+// It invalidates rather than clears, so nothing has to be restored: the next
+// published frame, whether a tapped 0x90 during the lease or the first real
+// poll after it, makes canonical status authoritative again on its own.
+func (s *StatusState) InvalidatePreLeaseStatus() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.invalidBeforeGeneration = s.protocolGeneration
+}
+
+// protocolSnapshot reads the retained status with the metadata Resolve needs to
+// judge it, under one lock so the three cannot disagree with each other.
+func (s *StatusState) protocolSnapshot() (api.Status, time.Time, bool) {
+	if s == nil {
+		return api.Status{}, time.Time{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.protocolNative, s.lastProtocolAt, s.protocolGeneration > s.invalidBeforeGeneration
+}
+
 func (s *StatusState) Resolve(snapshot Snapshot) api.Status {
 	fallback := StatusFromSnapshot(snapshot)
 	if s == nil {
 		return applyContactMetadata(fallback, snapshot.UpdatedAt, time.Time{})
 	}
-	status := s.CurrentProtocolNative()
-	protocolAt := s.protocolUpdatedAt()
+	status, protocolAt, authoritative := s.protocolSnapshot()
+	// Report display-derived state alone while the retained frame is
+	// invalidated. Its timestamp is deliberately dropped as well: a lease can
+	// begin within the contact window of the last poll, so passing it here
+	// would answer recentContact true for a reading nothing is refreshing.
+	if !authoritative {
+		return applyContactMetadata(fallback, snapshot.UpdatedAt, time.Time{})
+	}
 	// Resolve is the display path, so it merges tapped state too. The
 	// provenance travels with the merged status, so callers that need
 	// authority -- fan policy, overtemperature standby, menu debug -- still

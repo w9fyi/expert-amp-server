@@ -666,8 +666,13 @@ func TestPassthroughLeaseStopsServingPreLeaseStatusAsCanonical(t *testing.T) {
 	if duringLease.Provenance != "display-frame" {
 		t.Fatalf("provenance = %q, want display-frame while only the display is being tapped", duringLease.Provenance)
 	}
+	// The display snapshot in this test carries no temperature or TX of its own,
+	// so anything here could only have come from the invalidated status frame.
+	// On real hardware the amplifier prints both on its LCD, and they do keep
+	// being reported during a lease -- as display-derived values, which is the
+	// point: the label tells the consumer which it is looking at.
 	if duringLease.TemperatureC != nil || duringLease.TX != nil {
-		t.Fatalf("protocol-only fields returned during a display-only lease: temp=%v tx=%v", duringLease.TemperatureC, duringLease.TX)
+		t.Fatalf("the invalidated status frame leaked into canonical status: temp=%v tx=%v", duringLease.TemperatureC, duringLease.TX)
 	}
 
 	// Disconnect. The port comes back but the first new poll reply has not

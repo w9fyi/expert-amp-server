@@ -98,13 +98,21 @@ status, telemetry keeps updating. That state is labelled
 when the client stops polling, and is never accepted as authority to actuate the
 amplifier. The server injects no bytes of its own while the lease is held.
 
-A client that never polls `0x90` is normal — SPE Expert Controller Plus reads
-the display and nothing else. In that case there is no tapped status to show, so
-canonical status reports display-derived state alone for the session: the
-pre-lease status-poll reading is dropped as the lease begins rather than served
-as though something were still refreshing it. Protocol-only fields such as
-temperature, SWR, TX and output level are simply absent until the server polls
-again after the client disconnects.
+A client that never polls `0x90` is normal — Expert Controller Plus reads the
+display and nothing else, in receive and under transmit alike. In that case
+there is no tapped status to show, so canonical status reports display-derived
+state alone for the session: the pre-lease status-poll reading is dropped as the
+lease begins rather than served as though something were still refreshing it.
+
+What that looks like in practice depends on the field. Values the amplifier also
+prints on its LCD — temperature, output level, SWR, TX — keep being reported,
+because the display tap is still decoding them, but they arrive as
+`provenance: "display-frame"` with display-derived confidence rather than as a
+status poll. Values only the status reply carries, such as the protocol band
+code and text, drop out until polling resumes. `recentContact` follows the
+display snapshot, which advances when the decoded screen changes rather than on
+every frame, so a static screen ages out of the contact window while frames are
+still arriving.
 
 Check `GET /api/v1/raw-passthrough`: it reports `blockedByArmedControls` when a
 session would be refused, `tapFresh` for display freshness, and

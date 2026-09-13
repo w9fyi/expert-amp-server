@@ -181,7 +181,8 @@ the server's own polling, so `BeginRawPassthrough` calls
 `StatusState.InvalidatePreLeaseStatus`: the retained `status-poll` frame stops
 being canonical immediately, rather than aging out of its five-second contact
 window. Without that, a client that forwards display frames but never asks for
-`0x90` — which is what SPE Expert Controller Plus actually does — would leave
+`0x90` — which is what Expert Controller Plus actually does, in receive and
+under transmit alike — would leave
 `/api/v1/status` and `/api/v1/alarms` serving pre-lease temperature, SWR, TX and
 output level labelled `status-poll` with `recentContact: true`, for a reading
 nothing was refreshing. Canonical status falls back to display-derived state
@@ -190,6 +191,17 @@ invalidation lifts itself on the next published frame, so nothing has to be
 restored on disconnect. The internal gates never depended on this — they test
 provenance and contact themselves — so this is an API-honesty fix, not a safety
 one.
+
+Falling back to display-derived state is not the same as reporting nothing, and
+the distinction is worth being precise about. The amplifier prints temperature,
+output level, SWR and TX on its own LCD, so the display tap keeps decoding them
+and canonical status keeps reporting them — but as `display-frame` with
+display-derived confidence, not as a status poll. What disappears is what only
+the status reply carries, such as the protocol band code and text. `recentContact`
+then follows the display snapshot, which advances when the decoded screen changes
+rather than on every frame, so a static screen ages out of the contact window
+while frames are still arriving. That is honest but pessimistic, and it is
+existing display-path behavior rather than anything the invalidation introduced.
 
 `GET /api/v1/raw-passthrough` reports whether a client is connected,
 `blockedByArmedControls` when a session would currently be refused, and

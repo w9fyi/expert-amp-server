@@ -152,8 +152,12 @@ nothing else, so the refusal reason never travels on it: the client sees a
 clean EOF, or `ECONNRESET` if it wrote first. The reason reaches the operator
 through the server log and `GET /api/v1/raw-passthrough`, which reports it in
 `blockedByArmedControls` and `note` from the same `AutomaticControlsArmedError`
-that names every control to disarm. (That error's 409 is for HTTP callers of the
-button and wake routes — a raw TCP client is never handed an HTTP status.)
+that names every control to disarm. (That error belongs to the raw listener's
+diagnostic path and nothing else: it is built only to write the refusal log line
+and that `note`, and it is never returned from an HTTP handler, so its `HTTPStatus`
+of 409 is never actually served to anyone. The 409 that button and wake callers
+receive comes from their own coordinator and `rawPassthroughActive` errors,
+described above, not from this one.)
 Nothing is silently suspended for the duration of a lease and nothing is
 automatically restored afterwards: tracking what was suspended and restoring it
 across disconnects, crashes and failed port reclamation is a second state

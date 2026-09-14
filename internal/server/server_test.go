@@ -2770,6 +2770,116 @@ func TestV1StatusWebsocketIgnoresLegacyPaceQueryParameter(t *testing.T) {
 	}
 }
 
+// End-to-end cover for the seam a direct GET cannot reach. Both transitions below
+// leave the retained protocol-native bytes identical and never touch the store,
+// so the decoded display is completely static -- which is the measured condition
+// of a real lease, because Expert Controller Plus forwards display frames and
+// never polls 0x90, and a steady amplifier screen does not move. Nothing but the
+// authority transition itself can wake the socket here.
+func TestV1StatusWebsocketObservesLeaseAuthorityTransitionsWithAStaticDisplay(t *testing.T) {
+	store := runtime.NewStore(runtime.Snapshot{
+		Telemetry: api.Telemetry{
+			Band:       "20m",
+			Source:     "serial",
+			Confidence: "display-derived",
+			Provenance: "display-frame",
+		},
+		UpdatedAt: time.Now().UTC(),
+	})
+
+	temperature := 42.0
+	polled := api.Status{
+		Telemetry: api.Telemetry{
+			OperatingState: "operate",
+			TemperatureC:   &temperature,
+			Source:         "serial",
+			Confidence:     "protocol-native",
+			Provenance:     "status-poll",
+		},
+		BandCode: "05",
+		BandText: "20m",
+	}
+
+	statusState := runtime.NewStatusState(api.Status{})
+	handler := NewHandler(Options{
+		IndexHTML:   []byte("ok"),
+		DocsHTML:    []byte("<html>docs</html>"),
+		OpenAPIJSON: []byte(`{"openapi":"3.0.3"}`),
+		ROM:         font.Builtin(),
+		Store:       store,
+		StatusState: statusState,
+		DemoState:   display.DemoState(),
+		AltState:    display.DemoStateAlt(),
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	statusState.UpdateProtocolNative(polled)
+
+	conn := dialWS(t, server.URL, "/api/v1/status/ws")
+	defer conn.Close()
+
+	// A missing wake-up shows up as a read that never completes, which is also
+	// what an unrelated websocket timeout looks like. Name the phase so a failure
+	// here can never be read as ambient flakiness.
+	read := func(phase string) api.Status {
+		t.Helper()
+		if err := conn.SetReadDeadline(time.Now().Add(6 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline before %s: %v", phase, err)
+		}
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("no status websocket frame after %s: %v", phase, err)
+		}
+		var status api.Status
+		if err := json.Unmarshal(payload, &status); err != nil {
+			t.Fatalf("Unmarshal websocket payload after %s: %v payload=%s", phase, err, string(payload))
+		}
+		return status
+	}
+
+	// 1. The socket opens on the polled reading.
+	first := read("connecting")
+	if first.Provenance != "status-poll" || first.BandText != "20m" {
+		t.Fatalf("initial websocket payload did not carry the polled reading: %+v", first)
+	}
+	if first.TemperatureC == nil || *first.TemperatureC != 42 {
+		t.Fatalf("initial websocket temperature = %v, want 42", first.TemperatureC)
+	}
+
+	// 2. The lease begins. This is the call BeginRawPassthrough makes.
+	statusState.InvalidatePreLeaseStatus()
+
+	invalidated := read("the lease started")
+	if invalidated.Provenance == "status-poll" {
+		t.Fatalf("lease start never reached the websocket: it is still serving provenance %q. Invalidation changes what Resolve answers, so it has to wake subscribers too -- a client that connected before the lease must not keep the pre-lease reading", invalidated.Provenance)
+	}
+	if invalidated.TemperatureC != nil {
+		t.Fatalf("websocket still serves the pre-lease temperature %v while a lease holds the port", *invalidated.TemperatureC)
+	}
+	if invalidated.BandText != "" {
+		t.Fatalf("bandText = %q, want the protocol-only field to drop out during the lease", invalidated.BandText)
+	}
+	if invalidated.Band != "20m" {
+		t.Fatalf("band = %q, want display-derived state to keep working during the lease", invalidated.Band)
+	}
+
+	// 3. The client disconnects and the first poll answers byte-for-byte what the
+	// pre-lease poll answered, as a steady-state amplifier's will.
+	statusState.UpdateProtocolNative(polled)
+
+	restored := read("an unchanged first poll after the lease")
+	if restored.Provenance != "status-poll" {
+		t.Fatalf("an unchanged first poll after the lease never reached the websocket: provenance = %q. The frame lifts the invalidation even though its bytes did not change, so publishing only on changed bytes strands the socket on display-derived state", restored.Provenance)
+	}
+	if restored.TemperatureC == nil || *restored.TemperatureC != 42 {
+		t.Fatalf("websocket temperature = %v, want 42 restored by the repeat frame", restored.TemperatureC)
+	}
+	if restored.BandText != "20m" {
+		t.Fatalf("bandText = %q, want 20m restored by the repeat frame", restored.BandText)
+	}
+}
+
 func TestV1DisplayWebsocketSendsInitialSnapshotAndUpdates(t *testing.T) {
 	store := runtime.NewStore(runtime.Snapshot{Source: "fixture:home", FrameKind: "home", Sequence: 3, UpdatedAt: time.Now().UTC()})
 	handler := newTestHandler(store, runtime.FixtureCatalog{})

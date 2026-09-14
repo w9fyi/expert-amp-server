@@ -489,6 +489,64 @@ func TestStatusStateInvalidationLiftsOnTheNextPublishedFrameEvenIfUnchanged(t *t
 	}
 }
 
+// Authority and value are two different reasons for canonical status to move,
+// and only one of them shows up in the retained bytes. A lease start invalidates
+// a frame without touching it, and the first poll after a lease routinely
+// restores authority with a byte-identical reply, so a fan-out keyed on changed
+// bytes alone would leave every subscriber holding the wrong answer.
+func TestStatusStateWakesSubscribersOnAuthorityTransitions(t *testing.T) {
+	polled := api.Status{Telemetry: api.Telemetry{
+		OperatingState: "operate",
+		TemperatureC:   floatPtr(42),
+		Source:         "serial",
+		Confidence:     "protocol-native",
+		Provenance:     "status-poll",
+	}}
+
+	state := NewStatusState(api.Status{})
+	updates, unsubscribe := state.Subscribe(1)
+	defer unsubscribe()
+
+	expectWake := func(t *testing.T, why string) {
+		t.Helper()
+		select {
+		case <-updates:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no subscriber wake-up after %s", why)
+		}
+	}
+	expectNoWake := func(t *testing.T, why string) {
+		t.Helper()
+		select {
+		case got := <-updates:
+			t.Fatalf("unexpected subscriber wake-up after %s: %+v", why, got)
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+
+	state.UpdateProtocolNative(polled)
+	expectWake(t, "the first polled frame")
+
+	// Losing authority changes what Resolve answers, so it has to be published
+	// even though not one byte of the retained frame moved.
+	state.InvalidatePreLeaseStatus()
+	expectWake(t, "a lease invalidated the retained frame")
+
+	// Invalidating what is already invalid answers the same as before.
+	state.InvalidatePreLeaseStatus()
+	expectNoWake(t, "a repeat invalidation with nothing published in between")
+
+	// Byte-identical to the invalidated frame, and still the thing that makes
+	// canonical status authoritative again.
+	state.UpdateProtocolNative(polled)
+	expectWake(t, "an unchanged frame lifted the invalidation")
+
+	// With no invalidation in play an unchanged frame is genuinely nothing to
+	// report, which is the pre-existing contract this must not widen.
+	state.UpdateProtocolNative(polled)
+	expectNoWake(t, "an unchanged frame while already authoritative")
+}
+
 // A status state that has never had a lease must behave exactly as before,
 // including the seed value passed to NewStatusState.
 func TestStatusStateSeedIsCanonicalUntilSomethingInvalidatesIt(t *testing.T) {

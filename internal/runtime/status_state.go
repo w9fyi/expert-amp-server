@@ -66,20 +66,25 @@ func (s *StatusState) UpdateProtocolNative(status api.Status) {
 	now := time.Now().UTC()
 	s.mu.Lock()
 	changed := !reflect.DeepEqual(s.protocolNative, status)
+	wasAuthoritative := s.authoritativeLocked()
 	s.protocolNative = status
 	s.lastProtocolAt = now
 	// Counts every publication, not only changed ones: an unchanged repeat is
 	// still fresh evidence, and is what lifts a passthrough invalidation.
 	s.protocolGeneration++
-	subscribers := make([]chan api.Status, 0, len(s.subscribers))
-	if changed {
-		for ch := range s.subscribers {
-			subscribers = append(subscribers, ch)
-		}
+	// A frame that lifts an invalidation changes what Resolve answers even when
+	// the bytes are identical -- a steady-state amplifier repeats itself, so the
+	// first poll after a lease is routinely byte-for-byte the pre-lease reply.
+	// Notifying only on changed bytes would restore direct-GET semantics while
+	// leaving every open status websocket on the display-derived fallback.
+	notify := changed || s.authoritativeLocked() != wasAuthoritative
+	var subscribers []chan api.Status
+	if notify {
+		subscribers = s.subscribersLocked()
 	}
 	s.mu.Unlock()
 
-	if !changed {
+	if !notify {
 		return
 	}
 	for _, ch := range subscribers {
@@ -87,6 +92,12 @@ func (s *StatusState) UpdateProtocolNative(status api.Status) {
 	}
 }
 
+// Subscribe returns a channel that wakes when the canonical status view may have
+// changed. The delivered api.Status is the retained protocol-native frame, which
+// is deliberately not the answer: a subscriber that needs canonical status must
+// call Resolve for itself, because a wake-up can mean the retained frame stopped
+// being authoritative rather than that its contents moved. Sends are dropped
+// rather than queued, so a slow subscriber costs the publisher nothing.
 func (s *StatusState) Subscribe(buffer int) (<-chan api.Status, func()) {
 	if s == nil {
 		return nil, func() {}
@@ -127,13 +138,53 @@ func (s *StatusState) Subscribe(buffer int) (<-chan api.Status, func()) {
 // It invalidates rather than clears, so nothing has to be restored: the next
 // published frame, whether a tapped 0x90 during the lease or the first real
 // poll after it, makes canonical status authoritative again on its own.
+//
+// Losing authority changes what Resolve answers without changing a byte of the
+// retained frame, so subscribers are woken here too. Without that an already-open
+// status websocket keeps serving the pre-lease status-poll payload for as long as
+// the external client holds the port and the decoded display stays still.
 func (s *StatusState) InvalidatePreLeaseStatus() {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Invalidating what is already invalid changes nothing, so it wakes nobody.
+	// The post-state is non-authoritative by construction, which is why only the
+	// prior value has to be tested.
+	notify := s.authoritativeLocked()
 	s.invalidBeforeGeneration = s.protocolGeneration
+	var subscribers []chan api.Status
+	if notify {
+		subscribers = s.subscribersLocked()
+	}
+	status := s.protocolNative
+	s.mu.Unlock()
+
+	if !notify {
+		return
+	}
+	// pushStatus never blocks, which is what makes this safe to call from
+	// BeginRawPassthrough while it holds writeMu and lifecycleMu: a woken
+	// subscriber takes only this mutex, and the publisher never waits on it.
+	for _, ch := range subscribers {
+		pushStatus(ch, status)
+	}
+}
+
+// authoritativeLocked reports whether the retained protocol-native frame still
+// speaks for the amplifier. Callers must hold mu, for read or write.
+func (s *StatusState) authoritativeLocked() bool {
+	return s.protocolGeneration > s.invalidBeforeGeneration
+}
+
+// subscribersLocked copies the subscriber set so the push can happen after mu is
+// released. Callers must hold mu for write.
+func (s *StatusState) subscribersLocked() []chan api.Status {
+	subscribers := make([]chan api.Status, 0, len(s.subscribers))
+	for ch := range s.subscribers {
+		subscribers = append(subscribers, ch)
+	}
+	return subscribers
 }
 
 // protocolSnapshot reads the retained status with the metadata Resolve needs to
@@ -144,7 +195,7 @@ func (s *StatusState) protocolSnapshot() (api.Status, time.Time, bool) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.protocolNative, s.lastProtocolAt, s.protocolGeneration > s.invalidBeforeGeneration
+	return s.protocolNative, s.lastProtocolAt, s.authoritativeLocked()
 }
 
 func (s *StatusState) Resolve(snapshot Snapshot) api.Status {

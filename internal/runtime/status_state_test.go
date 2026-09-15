@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -557,6 +558,127 @@ func TestStatusStateSeedIsCanonicalUntilSomethingInvalidatesIt(t *testing.T) {
 
 	if resolved := seeded.Resolve(Snapshot{}); resolved.ModelName != "EXPERT 2K-FA" {
 		t.Fatalf("seeded status was not resolved: %+v", resolved)
+	}
+}
+
+// A status websocket that goes away mid-fan-out removes and closes its own
+// subscriber channel. If a publisher were to copy the subscriber set, release
+// mu and only then send, that close can land in the gap and the send panics on
+// a closed channel -- taking polling and monitoring down with the process. Both
+// publishing paths are covered: a lease invalidating the retained frame, and an
+// unchanged frame restoring authority afterwards, which is exactly the wake-up
+// that has no changed bytes to hide behind.
+//
+// Run this under -race: the detector reports the close/send ordering even on the
+// iterations where the timing does not actually produce a panic.
+func TestStatusStateNotificationDoesNotRaceSubscriberRemoval(t *testing.T) {
+	polled := api.Status{Telemetry: api.Telemetry{
+		OperatingState: "operate",
+		TemperatureC:   floatPtr(42),
+		Source:         "serial",
+		Confidence:     "protocol-native",
+		Provenance:     "status-poll",
+	}}
+
+	cases := []struct {
+		name string
+		// arrange leaves the state in the condition where publish notifies.
+		arrange func(*StatusState)
+		publish func(*StatusState)
+	}{
+		{
+			name: "lease invalidates the retained frame",
+			arrange: func(state *StatusState) {
+				state.UpdateProtocolNative(polled)
+			},
+			publish: func(state *StatusState) {
+				state.InvalidatePreLeaseStatus()
+			},
+		},
+		{
+			name: "unchanged frame restores authority after a lease",
+			arrange: func(state *StatusState) {
+				state.UpdateProtocolNative(polled)
+				state.InvalidatePreLeaseStatus()
+			},
+			publish: func(state *StatusState) {
+				// Byte-identical to the retained frame: this wakes subscribers
+				// only because it lifts the invalidation.
+				state.UpdateProtocolNative(polled)
+			},
+		},
+	}
+
+	const (
+		iterations  = 300
+		subscribers = 8
+	)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i < iterations; i++ {
+				state := NewStatusState(api.Status{})
+				tc.arrange(state)
+
+				unsubscribes := make([]func(), 0, subscribers)
+				for j := 0; j < subscribers; j++ {
+					_, unsubscribe := state.Subscribe(1)
+					unsubscribes = append(unsubscribes, unsubscribe)
+				}
+
+				// Recovering here is test instrumentation, not a production
+				// strategy: without it a send on a closed channel aborts the
+				// whole package run with a bare stack trace, and the point of
+				// this test is to name which publisher raced the disconnect.
+				panicked := make(chan any, 1)
+				start := make(chan struct{})
+				var wg sync.WaitGroup
+
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer func() {
+						if r := recover(); r != nil {
+							panicked <- r
+						}
+					}()
+					<-start
+					tc.publish(state)
+				}()
+
+				for _, unsubscribe := range unsubscribes {
+					wg.Add(1)
+					go func(unsubscribe func()) {
+						defer wg.Done()
+						<-start
+						unsubscribe()
+					}(unsubscribe)
+				}
+
+				close(start)
+				wg.Wait()
+
+				select {
+				case r := <-panicked:
+					t.Fatalf("publishing raced a concurrent unsubscribe on iteration %d: %v", i, r)
+				default:
+				}
+			}
+		})
+	}
+}
+
+// Unsubscribing twice must stay harmless: the second call finds the channel
+// already removed and must not close it again, which is its own panic.
+func TestStatusStateUnsubscribeIsIdempotent(t *testing.T) {
+	state := NewStatusState(api.Status{})
+	updates, unsubscribe := state.Subscribe(1)
+
+	unsubscribe()
+	unsubscribe()
+
+	if _, ok := <-updates; ok {
+		t.Fatal("expected the unsubscribed channel to be closed")
 	}
 }
 

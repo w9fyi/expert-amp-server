@@ -65,6 +65,8 @@ func (s *StatusState) UpdateProtocolNative(status api.Status) {
 
 	now := time.Now().UTC()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	changed := !reflect.DeepEqual(s.protocolNative, status)
 	wasAuthoritative := s.authoritativeLocked()
 	s.protocolNative = status
@@ -77,18 +79,8 @@ func (s *StatusState) UpdateProtocolNative(status api.Status) {
 	// first poll after a lease is routinely byte-for-byte the pre-lease reply.
 	// Notifying only on changed bytes would restore direct-GET semantics while
 	// leaving every open status websocket on the display-derived fallback.
-	notify := changed || s.authoritativeLocked() != wasAuthoritative
-	var subscribers []chan api.Status
-	if notify {
-		subscribers = s.subscribersLocked()
-	}
-	s.mu.Unlock()
-
-	if !notify {
-		return
-	}
-	for _, ch := range subscribers {
-		pushStatus(ch, status)
+	if changed || s.authoritativeLocked() != wasAuthoritative {
+		s.notifySubscribersLocked(status)
 	}
 }
 
@@ -98,6 +90,11 @@ func (s *StatusState) UpdateProtocolNative(status api.Status) {
 // call Resolve for itself, because a wake-up can mean the retained frame stopped
 // being authoritative rather than that its contents moved. Sends are dropped
 // rather than queued, so a slow subscriber costs the publisher nothing.
+//
+// The returned function removes the subscriber and closes its channel, so a
+// reader may observe the close; it is idempotent, and it is serialized against
+// delivery by mu, so it can never close a channel a publisher is about to send
+// on. See notifySubscribersLocked.
 func (s *StatusState) Subscribe(buffer int) (<-chan api.Status, func()) {
 	if s == nil {
 		return nil, func() {}
@@ -148,26 +145,15 @@ func (s *StatusState) InvalidatePreLeaseStatus() {
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// Invalidating what is already invalid changes nothing, so it wakes nobody.
 	// The post-state is non-authoritative by construction, which is why only the
 	// prior value has to be tested.
 	notify := s.authoritativeLocked()
 	s.invalidBeforeGeneration = s.protocolGeneration
-	var subscribers []chan api.Status
 	if notify {
-		subscribers = s.subscribersLocked()
-	}
-	status := s.protocolNative
-	s.mu.Unlock()
-
-	if !notify {
-		return
-	}
-	// pushStatus never blocks, which is what makes this safe to call from
-	// BeginRawPassthrough while it holds writeMu and lifecycleMu: a woken
-	// subscriber takes only this mutex, and the publisher never waits on it.
-	for _, ch := range subscribers {
-		pushStatus(ch, status)
+		s.notifySubscribersLocked(s.protocolNative)
 	}
 }
 
@@ -177,14 +163,23 @@ func (s *StatusState) authoritativeLocked() bool {
 	return s.protocolGeneration > s.invalidBeforeGeneration
 }
 
-// subscribersLocked copies the subscriber set so the push can happen after mu is
-// released. Callers must hold mu for write.
-func (s *StatusState) subscribersLocked() []chan api.Status {
-	subscribers := make([]chan api.Status, 0, len(s.subscribers))
+// notifySubscribersLocked wakes every current subscriber. Callers must hold mu
+// for write, and delivery deliberately happens under that lock rather than to a
+// copied set after unlocking: unsubscribe closes its channel while holding mu,
+// so any copy-then-unlock-then-send publisher can be overtaken by a disconnect
+// and send on a closed channel, which panics. Holding mu across the send is what
+// makes removal and delivery mutually exclusive.
+//
+// It stays cheap enough to do under the lock because pushStatus never blocks --
+// a full subscriber is drained and overwritten, never waited on. That is also
+// what keeps it safe to call from BeginRawPassthrough while it holds writeMu and
+// lifecycleMu: the publisher acquires no further lock and never waits on a
+// subscriber, and a woken subscriber wants only this mutex, which it gets as
+// soon as the publisher returns.
+func (s *StatusState) notifySubscribersLocked(status api.Status) {
 	for ch := range s.subscribers {
-		subscribers = append(subscribers, ch)
+		pushStatus(ch, status)
 	}
-	return subscribers
 }
 
 // protocolSnapshot reads the retained status with the metadata Resolve needs to

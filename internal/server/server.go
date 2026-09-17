@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image/color"
 	"image/png"
@@ -464,7 +465,7 @@ func NewHandler(opts Options) http.Handler {
 			writeAPI(w, http.StatusOK, api.Response{Success: true, Data: rawpassthrough.Status{
 				Enabled:                    false,
 				AutomaticControlsAvailable: true,
-				Note:                       "raw serial passthrough is disabled; the server owns the serial port",
+				Note:                       rawPassthroughUnavailableNote(opts.Config),
 			}})
 			return
 		}
@@ -525,7 +526,7 @@ func NewHandler(opts Options) http.Handler {
 			case http.MethodGet:
 				writeAPI(w, http.StatusOK, api.Response{Success: true, Data: opts.Config.Get()})
 			case http.MethodPost:
-				handleSettingsUpdateAPI(w, r, opts.Config, func(settings config.Settings) {
+				handleSettingsUpdateAPI(w, r, opts.Config, opts.RawPassthrough, func(settings config.Settings) {
 					status := opts.StatusState.CurrentProtocolNativeWithContact()
 					opts.FanPolicy.UpdateSettings(status, fanPolicySettings(settings))
 				})
@@ -740,7 +741,7 @@ func handleWakeActionAPI(w http.ResponseWriter, r *http.Request, wakeTransport t
 	writeAPI(w, http.StatusOK, api.Response{Success: true, Message: "wake sent", Data: result})
 }
 
-func handleSettingsUpdateAPI(w http.ResponseWriter, r *http.Request, mgr *config.Manager, settingsApplied func(config.Settings)) {
+func handleSettingsUpdateAPI(w http.ResponseWriter, r *http.Request, mgr *config.Manager, passthrough *rawpassthrough.Controller, settingsApplied func(config.Settings)) {
 	current := mgr.Get()
 	req, err := decodeSettingsRequest(r)
 	if err != nil {
@@ -753,6 +754,22 @@ func handleSettingsUpdateAPI(w http.ResponseWriter, r *http.Request, mgr *config
 		return
 	}
 	nextSettings := mergeSettingsRequest(current.Settings, req)
+
+	// An automatic control that is armed while a raw client holds the port is a
+	// lie: it reports itself armed, and every serial write it would make is
+	// refused for the life of the lease. Refuse the arming instead, and hold the
+	// passthrough setup boundary across the commit so a session cannot be
+	// established in the gap between deciding and writing. Disarming is never
+	// blocked, and neither is any other setting.
+	if arming := controlsNewlyArmedBy(current.Settings, nextSettings); len(arming) > 0 {
+		release, err := passthrough.HoldForArmingChange(arming)
+		if err != nil {
+			writeAPIError(w, conflictStatus(err), err.Error())
+			return
+		}
+		defer release()
+	}
+
 	next, err := mgr.Update(nextSettings)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -762,6 +779,77 @@ func handleSettingsUpdateAPI(w http.ResponseWriter, r *http.Request, mgr *config
 		settingsApplied(next.Settings)
 	}
 	writeAPI(w, http.StatusOK, api.Response{Success: true, Message: settingsMessage(current.Settings, next.Settings), Data: next})
+}
+
+// rawPassthroughUnavailableNote explains why no passthrough controller exists.
+//
+// "Disabled" is the wrong word for a configuration that asks for passthrough,
+// names a serial port, and still gets nothing: passthrough needs a serial
+// source, and no serial source is built while pollingMode is off, so the two
+// settings silently contradict each other. Saying which one won is the whole
+// point of this note -- the configuration is rejected, not quietly ignored.
+func rawPassthroughUnavailableNote(mgr *config.Manager) string {
+	const disabled = "raw serial passthrough is disabled; the server owns the serial port"
+	if mgr == nil {
+		return disabled
+	}
+	settings := mgr.Get().Settings
+	if !settings.RawPassthroughEnabled {
+		return disabled
+	}
+	if settings.SerialPort == "" {
+		return "raw serial passthrough is enabled but no serial port is configured, so there is nothing to lease"
+	}
+	if settings.PollingMode == string(config.PollingModeOff) {
+		return "raw serial passthrough is enabled but pollingMode is off, which stops the serial source it leases from being created. " +
+			"Set pollingMode to display, status or both and restart the server, or leave passthrough disabled."
+	}
+	return "raw serial passthrough is enabled but unavailable; restart the server for the change to take effect"
+}
+
+// armedAutomaticControls names the server-side automatic controls that these
+// settings leave armed.
+//
+// It has to agree with the ArmedAutomaticControls callback the raw passthrough
+// controller is built with in cmd/server: the two answer the same question from
+// opposite ends -- that one refuses a client while these are armed, this one
+// refuses arming while a client holds the port -- and a disagreement between
+// them would reopen the gap both exist to close.
+func armedAutomaticControls(settings config.Settings) []string {
+	var armed []string
+	if settings.AutomaticFanPolicyEnabled {
+		armed = append(armed, "automatic fan control")
+	}
+	if settings.SafetyMonitoringEnabled && settings.OvertemperatureStandbyArmed {
+		armed = append(armed, "overtemperature standby")
+	}
+	return armed
+}
+
+// controlsNewlyArmedBy names the controls an update would arm that are not armed
+// already. Re-sending a control that is already armed arms nothing, so it is not
+// a conflict; only a disarmed-to-armed transition is.
+func controlsNewlyArmedBy(current, next config.Settings) []string {
+	before := make(map[string]struct{})
+	for _, name := range armedAutomaticControls(current) {
+		before[name] = struct{}{}
+	}
+	var added []string
+	for _, name := range armedAutomaticControls(next) {
+		if _, armed := before[name]; !armed {
+			added = append(added, name)
+		}
+	}
+	return added
+}
+
+// conflictStatus reads the HTTP status an error carries, defaulting to 409.
+func conflictStatus(err error) int {
+	var coded interface{ HTTPStatus() int }
+	if errors.As(err, &coded) {
+		return coded.HTTPStatus()
+	}
+	return http.StatusConflict
 }
 
 func decodeSettingsRequest(r *http.Request) (settingsRequest, error) {
@@ -976,9 +1064,17 @@ func currentStatusPollingEnabled(cfg *config.Manager) bool {
 func settingsMessage(current, next config.Settings) string {
 	// Listen address and unified serial polling cadence/mode changes require a
 	// restart to take effect because they shape serial-source creation.
+	//
+	// Raw passthrough belongs on that list for the same reason: the controller
+	// is built once from the startup snapshot, so toggling it or moving its
+	// listener changes what is persisted and nothing about what is running.
+	// Reporting a bare "settings saved" for those two read as though the change
+	// had taken effect.
 	restartNeeded := current.ListenAddress != next.ListenAddress ||
 		current.PollIntervalMs != next.PollIntervalMs ||
-		current.PollingMode != next.PollingMode
+		current.PollingMode != next.PollingMode ||
+		current.RawPassthroughEnabled != next.RawPassthroughEnabled ||
+		current.RawPassthroughListenAddress != next.RawPassthroughListenAddress
 	if current.ListenAddress != next.ListenAddress {
 		return "settings saved, restart the server for the new listen address and runtime changes to take effect"
 	}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -4050,5 +4051,368 @@ func TestV1WakeActionReturnsUnavailableWhenMissing(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// leaseTestPort blocks in Read until closed, so a leased session sits quietly
+// instead of spinning the read loop.
+type leaseTestPort struct {
+	mu        sync.Mutex
+	closedCh  chan struct{}
+	closeOnce sync.Once
+}
+
+func (p *leaseTestPort) closedChan() chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closedCh == nil {
+		p.closedCh = make(chan struct{})
+	}
+	return p.closedCh
+}
+
+func (p *leaseTestPort) Read([]byte) (int, error) {
+	<-p.closedChan()
+	// A transport error, not io.EOF: readFromPort treats EOF as "keep going",
+	// which would spin the loop on a closed port instead of unwinding it.
+	return 0, errors.New("port has been closed")
+}
+func (p *leaseTestPort) Write(buf []byte) (int, error) { return len(buf), nil }
+func (p *leaseTestPort) Close() error {
+	ch := p.closedChan()
+	p.closeOnce.Do(func() { close(ch) })
+	return nil
+}
+func (p *leaseTestPort) SetReadTimeout(time.Duration) error { return nil }
+func (p *leaseTestPort) SetDTR(bool) error                  { return nil }
+func (p *leaseTestPort) SetRTS(bool) error                  { return nil }
+
+type leaseTestOpener struct{}
+
+func (leaseTestOpener) Open(string, int) (serial.Port, error) { return &leaseTestPort{}, nil }
+
+// POST /api/v1/settings must not be able to arm an automatic control while a raw
+// passthrough client holds the serial port. Before this the update was accepted
+// and persisted: the control read back as armed while the active lease refused
+// every serial write it would have made.
+func TestV1SettingsRefusesArmingWhileAPassthroughClientHoldsThePort(t *testing.T) {
+	mgr, err := config.NewManager(filepath.Join(t.TempDir(), "expert-amp-server.json"), ":8088")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	src := runtime.NewSerialSource(runtime.SerialSourceConfig{
+		Port:             "/dev/ttyTEST0",
+		BaudRate:         115200,
+		ReadTimeout:      10 * time.Millisecond,
+		ReadSize:         512,
+		MinFrameLen:      64,
+		MaxBuffer:        8192,
+		IOTimeout:        2 * time.Second,
+		ReconnectBackoff: 50 * time.Millisecond,
+	}, leaseTestOpener{}, runtime.Update{})
+
+	srcCtx, stopSrc := context.WithCancel(context.Background())
+	defer stopSrc()
+	src.Start(srcCtx)
+
+	controller := rawpassthrough.New(rawpassthrough.Config{
+		Enabled:                true,
+		ListenAddress:          "127.0.0.1:0",
+		Source:                 src,
+		ArmedAutomaticControls: func() []string { return nil },
+	})
+	if controller == nil {
+		t.Fatal("expected a controller for an enabled config")
+	}
+	listenCtx, stopListener := context.WithCancel(context.Background())
+	defer stopListener()
+	go func() { _ = controller.Start(listenCtx) }()
+
+	var addr string
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if addr = controller.Addr(); addr != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addr == "" {
+		t.Fatal("listener never bound")
+	}
+
+	handler := NewHandler(Options{
+		Config:         mgr,
+		StatusState:    runtime.NewStatusState(api.Status{}),
+		FanPolicy:      fanpolicy.NewController(),
+		RawPassthrough: controller,
+	})
+
+	// Arming is allowed while nothing holds the port.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/settings", strings.NewReader(`{"automaticFanPolicyEnabled":true}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("idle arming status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	// Put it back so the lease can be taken at all.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/settings", strings.NewReader(`{"automaticFanPolicyEnabled":false}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disarm status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	leaseDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(leaseDeadline) {
+		if controller.Status().ClientConnected {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !controller.Status().ClientConnected {
+		t.Fatal("no passthrough lease was established")
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "automatic fan control", body: `{"automaticFanPolicyEnabled":true}`, want: "automatic fan control"},
+		{name: "overtemperature standby", body: `{"safetyMonitoringEnabled":true,"overtemperatureStandbyArmed":true}`, want: "overtemperature standby"},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/settings", strings.NewReader(tc.body)))
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("%s: status = %d, want 409; body=%s", tc.name, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), tc.want) {
+			t.Fatalf("%s: body %q does not name the control", tc.name, rec.Body.String())
+		}
+	}
+
+	settings := mgr.Get().Settings
+	if settings.AutomaticFanPolicyEnabled {
+		t.Fatal("automatic fan control was persisted as armed during a lease")
+	}
+	if settings.SafetyMonitoringEnabled && settings.OvertemperatureStandbyArmed {
+		t.Fatal("overtemperature standby was persisted as armed during a lease")
+	}
+
+	// Everything that does not arm a control still goes through untouched.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/settings", strings.NewReader(`{"menuDebugEnabled":true}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unrelated setting during a lease: status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !mgr.Get().Settings.MenuDebugEnabled {
+		t.Fatal("unrelated setting was not persisted during a lease")
+	}
+}
+
+// Only a disarmed-to-armed transition is a conflict. Re-sending a control that
+// is already armed arms nothing, and disarming must never be blocked.
+func TestControlsNewlyArmedByNamesOnlyTransitions(t *testing.T) {
+	armed := config.Settings{AutomaticFanPolicyEnabled: true, SafetyMonitoringEnabled: true, OvertemperatureStandbyArmed: true}
+	disarmed := config.Settings{}
+
+	if got := controlsNewlyArmedBy(disarmed, armed); len(got) != 2 {
+		t.Fatalf("arming both = %v, want two controls", got)
+	}
+	if got := controlsNewlyArmedBy(armed, armed); len(got) != 0 {
+		t.Fatalf("re-sending an armed state = %v, want none", got)
+	}
+	if got := controlsNewlyArmedBy(armed, disarmed); len(got) != 0 {
+		t.Fatalf("disarming = %v, want none", got)
+	}
+	// Safety monitoring off means overtemperature standby is not armed at all.
+	halfArmed := config.Settings{OvertemperatureStandbyArmed: true}
+	if got := controlsNewlyArmedBy(disarmed, halfArmed); len(got) != 0 {
+		t.Fatalf("standby armed without safety monitoring = %v, want none", got)
+	}
+}
+
+// A status websocket must not be able to miss an authority transition that
+// lands while it is connecting.
+//
+// Before the fix the handler resolved and sent its first payload and only then
+// subscribed, so a transition published in that gap -- which spans a JSON
+// marshal and a socket write, not a single instruction -- reached nobody. With
+// a static display nothing else ever wakes the socket, so it served the wrong
+// authority for the life of the connection.
+//
+// The window is timing-dependent, so this drives it repeatedly with jittered
+// offsets rather than claiming to hit it deterministically. Each attempt must
+// converge: either the initial payload already reflects the lease, or a
+// correction follows it.
+func TestV1StatusWebsocketDoesNotLoseATransitionRacingConnectionSetup(t *testing.T) {
+	store := runtime.NewStore(runtime.Snapshot{
+		Telemetry: api.Telemetry{
+			Band:       "20m",
+			Source:     "serial",
+			Confidence: "display-derived",
+			Provenance: "display-frame",
+		},
+		UpdatedAt: time.Now().UTC(),
+	})
+
+	temperature := 42.0
+	polled := api.Status{
+		Telemetry: api.Telemetry{
+			OperatingState: "operate",
+			TemperatureC:   &temperature,
+			Source:         "serial",
+			Confidence:     "protocol-native",
+			Provenance:     "status-poll",
+		},
+		BandCode: "05",
+		BandText: "20m",
+	}
+
+	statusState := runtime.NewStatusState(api.Status{})
+	handler := NewHandler(Options{
+		IndexHTML:   []byte("ok"),
+		ROM:         font.Builtin(),
+		Store:       store,
+		StatusState: statusState,
+		DemoState:   display.DemoState(),
+		AltState:    display.DemoStateAlt(),
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	const attempts = 400
+	for attempt := range attempts {
+		// Start every attempt authoritative again. The display never moves, so
+		// the status subscription is the only thing that can wake the socket.
+		statusState.UpdateProtocolNative(polled)
+
+		fired := make(chan struct{})
+		go func(offset time.Duration) {
+			time.Sleep(offset)
+			statusState.InvalidatePreLeaseStatus()
+			close(fired)
+		}(time.Duration(attempt%200) * 2 * time.Microsecond)
+
+		conn := dialWS(t, server.URL, "/api/v1/status/ws")
+		<-fired
+
+		converged := false
+		deadline := time.Now().Add(3 * time.Second)
+		for !converged && time.Now().Before(deadline) {
+			if err := conn.SetReadDeadline(deadline); err != nil {
+				t.Fatalf("attempt %d: SetReadDeadline: %v", attempt, err)
+			}
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+			var status api.Status
+			if err := json.Unmarshal(payload, &status); err != nil {
+				t.Fatalf("attempt %d: Unmarshal: %v payload=%s", attempt, err, string(payload))
+			}
+			if status.Provenance != "status-poll" {
+				converged = true
+			}
+		}
+		conn.Close()
+
+		if !converged {
+			t.Fatalf("attempt %d: the websocket never saw the lease. A transition published while the handler was connecting reached nobody, and with a static display nothing else will ever wake it", attempt)
+		}
+	}
+}
+
+// pollingMode off and rawPassthroughEnabled true contradict each other: no
+// serial source is built, so passthrough gets nothing to lease. The endpoint
+// has to say which setting won rather than reporting a bare "disabled" that
+// reads as though the operator had turned passthrough off themselves.
+func TestV1RawPassthroughExplainsWhyItIsUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mutate   func(config.Settings) config.Settings
+		contains string
+	}{
+		{
+			name: "polling off",
+			mutate: func(s config.Settings) config.Settings {
+				s.PollingMode = "off"
+				s.SerialPort = "/dev/ttyTEST0"
+				s.RawPassthroughEnabled = true
+				return s
+			},
+			contains: "pollingMode is off",
+		},
+		{
+			name:     "no serial port",
+			mutate:   func(s config.Settings) config.Settings { s.SerialPort = ""; s.RawPassthroughEnabled = true; return s },
+			contains: "no serial port is configured",
+		},
+		{
+			name:     "genuinely disabled",
+			mutate:   func(s config.Settings) config.Settings { s.RawPassthroughEnabled = false; return s },
+			contains: "raw serial passthrough is disabled",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, err := config.NewManager(filepath.Join(t.TempDir(), "expert-amp-server.json"), ":8088")
+			if err != nil {
+				t.Fatalf("NewManager: %v", err)
+			}
+			if _, err := mgr.Update(tc.mutate(mgr.Get().Settings)); err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+
+			handler := NewHandler(Options{
+				Config:      mgr,
+				StatusState: runtime.NewStatusState(api.Status{}),
+				FanPolicy:   fanpolicy.NewController(),
+			})
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/raw-passthrough", nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.contains) {
+				t.Fatalf("body %q does not explain the state (want %q)", rec.Body.String(), tc.contains)
+			}
+		})
+	}
+}
+
+// Toggling passthrough or moving its listener changes the persisted settings and
+// nothing about the running controller, which is built from the startup
+// snapshot. The reply has to say a restart is needed.
+func TestV1SettingsReportsRawPassthroughChangesAsRestartRequiring(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "enable", body: `{"rawPassthroughEnabled":true}`},
+		{name: "listen address", body: `{"rawPassthroughListenAddress":":7399"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, err := config.NewManager(filepath.Join(t.TempDir(), "expert-amp-server.json"), ":8088")
+			if err != nil {
+				t.Fatalf("NewManager: %v", err)
+			}
+			handler := NewHandler(Options{
+				Config:      mgr,
+				StatusState: runtime.NewStatusState(api.Status{}),
+				FanPolicy:   fanpolicy.NewController(),
+			})
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/settings", strings.NewReader(tc.body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "restart") {
+				t.Fatalf("reply %q does not mention a restart", rec.Body.String())
+			}
+		})
 	}
 }

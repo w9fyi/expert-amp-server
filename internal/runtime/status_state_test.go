@@ -685,3 +685,125 @@ func TestStatusStateUnsubscribeIsIdempotent(t *testing.T) {
 func floatPtr(v float64) *float64 {
 	return &v
 }
+
+// TestStatusStateExpiresStaleTappedStatusBackToDisplayDerived pins the exact
+// case reported against d1803a5: a tapped frame that stopped being refreshed
+// outranking newer display telemetry, and borrowing that newer telemetry's
+// timestamp to call itself current.
+//
+// The lease shape this comes from is the measured one, not a hypothetical --
+// Expert Controller Plus never sends 0x90, so a tap can fall silent for the
+// whole session while display frames keep arriving at full rate.
+func TestStatusStateExpiresStaleTappedStatusBackToDisplayDerived(t *testing.T) {
+	state := NewStatusState(api.Status{})
+	state.UpdateProtocolNative(api.Status{Telemetry: api.Telemetry{
+		Provenance:         "status-poll",
+		Source:             "serial",
+		Confidence:         "protocol-native",
+		TemperatureC:       floatPtr(40),
+		TemperatureDisplay: "40 C",
+	}})
+	// One tapped frame lands as the lease begins, then nothing more.
+	state.UpdateProtocolNative(api.Status{Telemetry: api.Telemetry{
+		Provenance:         ProvenancePassthroughTap,
+		Source:             "serial",
+		Confidence:         "protocol-native",
+		TemperatureC:       floatPtr(40),
+		TemperatureDisplay: "40 C",
+	}})
+
+	freshDisplay := Snapshot{
+		UpdatedAt: time.Now().UTC(),
+		Telemetry: api.Telemetry{
+			Provenance:         "display-frame",
+			Source:             "serial",
+			Confidence:         "display-derived",
+			TemperatureC:       floatPtr(80),
+			TemperatureDisplay: "80 C",
+		},
+	}
+
+	// While the tap is still being refreshed it legitimately speaks.
+	if status := state.Resolve(freshDisplay); status.Provenance != ProvenancePassthroughTap {
+		t.Fatalf("fresh tap provenance = %q, want %q", status.Provenance, ProvenancePassthroughTap)
+	}
+
+	// Age the tap past its window. Setting the field directly is what keeps this
+	// exact and instant; the alternative is sleeping out RecentContactWindow.
+	state.mu.Lock()
+	state.lastProtocolAt = time.Now().UTC().Add(-(RecentContactWindow + time.Second))
+	state.mu.Unlock()
+
+	status := state.Resolve(freshDisplay)
+	if status.Provenance == ProvenancePassthroughTap {
+		t.Fatalf("stale tap still canonical: provenance = %q", status.Provenance)
+	}
+	if status.Provenance != "display-frame" {
+		t.Fatalf("provenance = %q, want display-frame", status.Provenance)
+	}
+	if status.TemperatureC == nil || *status.TemperatureC != 80 {
+		t.Fatalf("temperatureC = %v, want the fresh display-derived 80", status.TemperatureC)
+	}
+	if status.TemperatureDisplay != "80 C" {
+		t.Fatalf("temperatureDisplay = %q, want %q", status.TemperatureDisplay, "80 C")
+	}
+	// recentContact may still be true here, and correctly so: it is now saying
+	// the display is being refreshed, which it is. What it must never do is
+	// report freshness on behalf of a reading the tap supplied and abandoned.
+	if !status.RecentContact {
+		t.Fatal("recentContact = false, want true from the fresh display snapshot")
+	}
+}
+
+// TestStatusStateKeepsTappedStatusWhileTheTapIsStillFresh guards the other
+// direction, so the expiry above cannot be "fixed" by dropping tapped status
+// altogether -- during a lease a live tap is the best evidence there is.
+func TestStatusStateKeepsTappedStatusWhileTheTapIsStillFresh(t *testing.T) {
+	state := NewStatusState(api.Status{})
+	state.UpdateProtocolNative(api.Status{Telemetry: api.Telemetry{
+		Provenance:   ProvenancePassthroughTap,
+		Source:       "serial",
+		Confidence:   "protocol-native",
+		TemperatureC: floatPtr(40),
+	}})
+
+	status := state.Resolve(Snapshot{
+		UpdatedAt: time.Now().UTC(),
+		Telemetry: api.Telemetry{Provenance: "display-frame", TemperatureC: floatPtr(80)},
+	})
+	if status.Provenance != ProvenancePassthroughTap {
+		t.Fatalf("provenance = %q, want %q", status.Provenance, ProvenancePassthroughTap)
+	}
+	if status.TemperatureC == nil || *status.TemperatureC != 40 {
+		t.Fatalf("temperatureC = %v, want the live tapped 40", status.TemperatureC)
+	}
+}
+
+// TestStatusStateDoesNotExpireStatusPollOnTapStaleness pins the scope of the
+// expiry. A status-poll frame is refreshed by the server's own polling and its
+// age is already reported truthfully by recentContact; expiring it here would
+// change normal non-lease behavior, which is not what the tap fix is for.
+func TestStatusStateDoesNotExpireStatusPollOnTapStaleness(t *testing.T) {
+	state := NewStatusState(api.Status{})
+	state.UpdateProtocolNative(api.Status{Telemetry: api.Telemetry{
+		Provenance:   "status-poll",
+		Source:       "serial",
+		Confidence:   "protocol-native",
+		TemperatureC: floatPtr(40),
+	}})
+
+	state.mu.Lock()
+	state.lastProtocolAt = time.Now().UTC().Add(-(RecentContactWindow + time.Second))
+	state.mu.Unlock()
+
+	status := state.Resolve(Snapshot{
+		UpdatedAt: time.Now().UTC(),
+		Telemetry: api.Telemetry{Provenance: "display-frame", TemperatureC: floatPtr(80)},
+	})
+	if status.Provenance != "status-poll" {
+		t.Fatalf("provenance = %q, want status-poll to be unaffected", status.Provenance)
+	}
+	if status.TemperatureC == nil || *status.TemperatureC != 40 {
+		t.Fatalf("temperatureC = %v, want the retained status-poll 40", status.TemperatureC)
+	}
+}

@@ -114,11 +114,29 @@ display snapshot, which advances when the decoded screen changes rather than on
 every frame, so a static screen ages out of the contact window while frames are
 still arriving.
 
+A client that does ask for `0x90` gets its reply reported as
+`provenance: "passthrough-tap"`, but only while it keeps asking. Nothing obliges
+it to, so a tap that stops being refreshed expires back to display-derived state
+rather than outranking newer display telemetry indefinitely — the same place a
+lease that never tapped anything starts from.
+
 Check `GET /api/v1/raw-passthrough`: it reports `blockedByArmedControls` when a
 session would be refused, `tapFresh` for display freshness, and
 `automaticControlsAvailable`, which reports whether the server owns the serial
 port — false for the lifetime of a lease, true when no client is connected. It
 does not report whether a control is armed; `blockedByArmedControls` does that.
+`listenerAvailable` reports whether the TCP listener actually bound. `enabled`
+means configured *and* running, so a listener that failed to bind reports
+`enabled: false` alongside `listenerAvailable: false`, with the bind error in
+`note` — that pair is what tells a passthrough that could not start from one you
+turned off.
+
+Arming automatic fan control or overtemperature standby is refused with HTTP 409
+while a client holds the port. Those controls cannot act during a lease, so
+accepting the change would leave a control that reads as armed and does nothing.
+Disarming is always allowed. `rawPassthroughEnabled` and
+`rawPassthroughListenAddress` take effect on restart, because the listener is
+built from the startup configuration.
 
 ## API highlights
 

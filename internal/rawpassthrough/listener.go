@@ -76,6 +76,56 @@ func ErrAutomaticControlsArmed(controls []string) error {
 	return &AutomaticControlsArmedError{Controls: controls}
 }
 
+// ArmingDuringLeaseError reports that an automatic control could not be armed
+// because a raw passthrough client currently holds the serial port. Controls
+// names what the rejected update would have armed.
+type ArmingDuringLeaseError struct {
+	Controls []string
+}
+
+func (e *ArmingDuringLeaseError) Error() string {
+	return fmt.Sprintf(
+		"cannot arm these automatic controls while a raw passthrough client holds the serial port: %s. "+
+			"The server sends no serial bytes of its own during a passthrough lease, so they would read as armed "+
+			"without being able to act. Disconnect the passthrough client first.",
+		strings.Join(e.Controls, ", "),
+	)
+}
+
+// HTTPStatus is 409: the request conflicts with current server state, and
+// succeeds unchanged once the lease ends.
+func (e *ArmingDuringLeaseError) HTTPStatus() int { return http.StatusConflict }
+
+// HoldForArmingChange reserves the session-setup boundary so that arming an
+// automatic control and starting a passthrough session cannot interleave.
+//
+// A check that merely asked "is a client connected?" and then returned would
+// not be enough. serve decides the refusal and claims the port under setupMu,
+// so a settings update racing it could read "no client", get descheduled, and
+// commit the arming while a session was being established -- leaving controls
+// that report themselves armed for a lease that blocks every write they would
+// make. Taking the same mutex is what removes the window: either serve claims
+// the port first and this returns the conflict, or this holds the boundary and
+// serve blocks until the arming is committed, whereupon its existing armed
+// controls check refuses the client for the stated reason.
+//
+// The caller must call the returned release exactly once when the update has
+// been committed. controls is only used to name the conflict.
+func (c *Controller) HoldForArmingChange(controls []string) (func(), error) {
+	if c == nil {
+		return func() {}, nil
+	}
+	c.setupMu.Lock()
+	c.mu.Lock()
+	leased := c.handle != nil
+	c.mu.Unlock()
+	if leased {
+		c.setupMu.Unlock()
+		return nil, &ArmingDuringLeaseError{Controls: controls}
+	}
+	return func() { c.setupMu.Unlock() }, nil
+}
+
 // armedControls reports which server-side automatic controls are armed.
 func (c *Controller) armedControls() []string {
 	if c == nil || c.cfg.ArmedAutomaticControls == nil {
@@ -119,11 +169,12 @@ type Controller struct {
 	// between the coordinator reservation and the serial port claim.
 	setupMu sync.Mutex
 
-	mu       sync.Mutex
-	listener net.Listener
-	conn     net.Conn
-	handle   *runtime.RawPassthroughHandle
-	since    time.Time
+	mu        sync.Mutex
+	listener  net.Listener
+	listenErr error
+	conn      net.Conn
+	handle    *runtime.RawPassthroughHandle
+	since     time.Time
 }
 
 // New builds a Controller. It returns nil when passthrough is not usable, so
@@ -143,10 +194,17 @@ func (c *Controller) Start(ctx context.Context) error {
 	var lc net.ListenConfig
 	listener, err := lc.Listen(ctx, "tcp", c.cfg.ListenAddress)
 	if err != nil {
+		// Remember why, so /api/v1/raw-passthrough can say the listener is not
+		// there instead of reporting a passthrough that is enabled in
+		// configuration and unreachable in fact.
+		c.mu.Lock()
+		c.listenErr = err
+		c.mu.Unlock()
 		return err
 	}
 	c.mu.Lock()
 	c.listener = listener
+	c.listenErr = nil
 	c.mu.Unlock()
 
 	log.Printf("raw serial passthrough listening on %s (serial port is leased exclusively while a client is connected)", c.cfg.ListenAddress)
@@ -384,6 +442,12 @@ type Status struct {
 	// reports which controls are armed right now.
 	AutomaticControlsAvailable bool `json:"automaticControlsAvailable"`
 
+	// ListenerAvailable reports whether the TCP listener is actually accepting.
+	// Enabled is configuration; this is runtime. They disagree when binding
+	// fails, and without it the endpoint reports an enabled passthrough that no
+	// client can ever reach.
+	ListenerAvailable bool `json:"listenerAvailable"`
+
 	Note string `json:"note,omitempty"`
 }
 
@@ -396,9 +460,25 @@ func (c *Controller) Status() Status {
 	conn := c.conn
 	handle := c.handle
 	since := c.since
+	listener := c.listener
+	listenErr := c.listenErr
 	c.mu.Unlock()
 
-	out := Status{Enabled: true, ListenAddress: c.cfg.ListenAddress}
+	out := Status{Enabled: true, ListenAddress: c.cfg.ListenAddress, ListenerAvailable: listener != nil}
+	if listenErr != nil {
+		// Enabled is documented as "configured and running", so a listener that
+		// never bound is not enabled however the configuration reads. Reporting
+		// it true here described a passthrough no client could reach.
+		// listenerAvailable and the note are what separate this from a
+		// passthrough the operator simply turned off.
+		out.Enabled = false
+		out.AutomaticControlsAvailable = true
+		out.BlockedByArmedControls = c.armedControls()
+		out.Note = fmt.Sprintf(
+			"raw serial passthrough is enabled but its listener is unavailable: %v. "+
+				"No client can connect, and the server owns the serial port.", listenErr)
+		return out
+	}
 	if conn == nil || handle == nil {
 		// Idle, armed or not: the server still owns the port, so its automatic
 		// controls can act. Armed controls block the next client from taking the

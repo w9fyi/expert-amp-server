@@ -1263,12 +1263,13 @@
           "enabled",
           "clientConnected",
           "tapFresh",
-          "automaticControlsAvailable"
+          "automaticControlsAvailable",
+          "listenerAvailable"
         ],
         "properties": {
           "enabled": {
             "type": "boolean",
-            "description": "Whether the raw passthrough listener is configured and running. False when rawPassthroughEnabled is off, when no serial port is configured, or when no listen address is set."
+            "description": "Whether the raw passthrough listener is configured and running. False when rawPassthroughEnabled is off, when no serial port is configured, when no listen address is set, or when the listener failed to bind -- see listenerAvailable and note to tell a disabled passthrough from one that could not start."
           },
           "listenAddress": {
             "type": "string",
@@ -1316,6 +1317,10 @@
           "automaticControlsAvailable": {
             "type": "boolean",
             "description": "Whether the server owns the serial port and could therefore act on it: false for the lifetime of a lease, true whenever no client is connected. This reports port ownership, not arming -- true does not mean any control is enabled or armed, which is what blockedByArmedControls reports."
+          },
+          "listenerAvailable": {
+            "type": "boolean",
+            "description": "Whether the TCP listener actually bound and is accepting. enabled reports configuration; this reports runtime. They disagree when the listen address is already in use, in which case no client can connect and note carries the bind error."
           },
           "note": {
             "type": "string",

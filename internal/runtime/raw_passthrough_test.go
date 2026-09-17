@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -740,5 +742,178 @@ func TestPassthroughTappedStatusRestoresCanonicalStatusDuringLease(t *testing.T)
 	}
 	if !resolved.RecentContact {
 		t.Fatal("a just-tapped status frame does not report recent contact")
+	}
+}
+
+// eofOnCloseSerialPort blocks in Read until the port is closed and then reports
+// io.EOF rather than a transport error. readFromPort treats EOF as "keep going",
+// so the read loop returns to the top of its loop and asks for its next poll
+// instead of unwinding -- which is precisely the state the deadlock needs, and
+// reaching it this way makes the test deterministic instead of timing-dependent.
+type eofOnCloseSerialPort struct {
+	mu           sync.Mutex
+	closed       bool
+	closedCh     chan struct{}
+	closeOnce    sync.Once
+	writeStarted chan struct{}
+	writes       int
+}
+
+func (p *eofOnCloseSerialPort) closedChan() chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closedCh == nil {
+		p.closedCh = make(chan struct{})
+	}
+	return p.closedCh
+}
+
+func (p *eofOnCloseSerialPort) Read(buf []byte) (int, error) {
+	<-p.closedChan()
+	return 0, io.EOF
+}
+
+func (p *eofOnCloseSerialPort) Write(buf []byte) (int, error) {
+	p.mu.Lock()
+	p.writes++
+	p.mu.Unlock()
+	if p.writeStarted != nil {
+		select {
+		case p.writeStarted <- struct{}{}:
+		default:
+		}
+	}
+	return len(buf), nil
+}
+
+func (p *eofOnCloseSerialPort) Close() error {
+	closedCh := p.closedChan()
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+	p.closeOnce.Do(func() { close(closedCh) })
+	return nil
+}
+
+func (p *eofOnCloseSerialPort) SetReadTimeout(time.Duration) error { return nil }
+func (p *eofOnCloseSerialPort) SetDTR(bool) error                  { return nil }
+func (p *eofOnCloseSerialPort) SetRTS(bool) error                  { return nil }
+
+// A scheduled poll waiting to enter writeFrameForSerialSession must not be able
+// to wedge lease acquisition.
+//
+// The retire waits for the read loop to unwind, and the read loop cannot unwind
+// until it gets writeMu, so holding writeMu across the retire deadlocks the two
+// against each other until the retire times out and refuses a client that should
+// have been admitted. Marking the transition under writeMu and releasing it
+// before the retire is what breaks the cycle: the parked poll acquires the
+// mutex, observes the flag, fails closed, and that failure is what ends the
+// session the retire is waiting for.
+func TestBeginRawPassthroughIsNotWedgedByAPollWaitingOnWriteMu(t *testing.T) {
+	live := &eofOnCloseSerialPort{writeStarted: make(chan struct{}, 1)}
+	leased := &mockSerialPort{blockRead: true}
+	reconnected := &mockSerialPort{blockRead: true}
+	opener := &sequenceSerialOpener{
+		ports:  []serial.Port{live, leased, reconnected},
+		opened: make(chan int, 3),
+	}
+	// A real poll frame and a short interval, so the read loop actually polls and
+	// a poll is due again the moment it returns to the top of its loop.
+	src := NewSerialSource(SerialSourceConfig{
+		Port:                      "/dev/ttyTEST0",
+		BaudRate:                  115200,
+		ReadTimeout:               10 * time.Millisecond,
+		ReadSize:                  512,
+		MinFrameLen:               64,
+		MaxBuffer:                 8192,
+		IOTimeout:                 2 * time.Second,
+		ReconnectBackoff:          100 * time.Millisecond,
+		PollingMode:               "status",
+		PollInterval:              time.Millisecond,
+		StatusPollCommandEnabled:  true,
+		StatusPollCommandFrameHex: "55555502",
+	}, opener, Update{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	src.Start(ctx)
+	defer cancel()
+	waitForCondition(t, time.Second, func() bool { return opener.openCount() == 1 })
+
+	// Wait until the read loop has issued at least one poll and settled into
+	// Read. From here, closing the port sends it straight back to the poll.
+	select {
+	case <-live.writeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("read loop never issued a scheduled poll")
+	}
+
+	beginCtx, beginCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer beginCancel()
+
+	done := make(chan error, 1)
+	var handle *RawPassthroughHandle
+	go func() {
+		h, err := src.BeginRawPassthrough(beginCtx)
+		handle = h
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("BeginRawPassthrough refused a valid client: %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("BeginRawPassthrough never returned: the retire and the parked poll deadlocked")
+	}
+
+	if handle == nil {
+		t.Fatal("no handle returned")
+	}
+	if handle.Port() != serial.Port(leased) {
+		t.Fatal("passthrough did not return the newly opened port")
+	}
+	handle.Close()
+}
+
+// The transition has to be visible to writers from the moment acquisition
+// starts, not from the moment it finishes. This pins the property the deadlock
+// fix depends on, without depending on the read loop's timing.
+func TestRawPassthroughTransitionRefusesWritesBeforeThePortIsInHand(t *testing.T) {
+	live := &mockSerialPort{blockRead: true}
+	leased := &mockSerialPort{blockRead: true}
+	opener := &sequenceSerialOpener{
+		ports:  []serial.Port{live, leased, &mockSerialPort{blockRead: true}},
+		opened: make(chan int, 3),
+	}
+	src := newPassthroughTestSource(t, opener)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	src.Start(ctx)
+	defer cancel()
+	waitForCondition(t, time.Second, func() bool { return opener.openCount() == 1 })
+
+	handle, err := src.BeginRawPassthrough(context.Background())
+	if err != nil {
+		t.Fatalf("BeginRawPassthrough error: %v", err)
+	}
+	defer handle.Close()
+
+	// A server write during the lease fails closed rather than blocking. The
+	// same flag is what a poll parked mid-transition observes.
+	writeErr := make(chan error, 1)
+	go func() {
+		writeErr <- src.writeFrameForSerialSession(context.Background(), []byte{0x90}, transport.SerialSessionWriteAuthorization{})
+	}()
+	select {
+	case err := <-writeErr:
+		if err == nil {
+			t.Fatal("write succeeded during a lease, want a refusal")
+		}
+		if transport.ButtonStatusCode(err) != 409 {
+			t.Fatalf("write error = %v (status %d), want the 409 raw-passthrough-active refusal", err, transport.ButtonStatusCode(err))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server write blocked instead of failing closed during a lease")
 	}
 }

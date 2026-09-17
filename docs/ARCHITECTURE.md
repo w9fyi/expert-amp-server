@@ -207,13 +207,31 @@ rather than on every frame, so a static screen ages out of the contact window
 while frames are still arriving. That is honest but pessimistic, and it is
 existing display-path behavior rather than anything the invalidation introduced.
 
+Tapped status is bounded the same way. A tapped `0x90` is canonical only while
+the external client keeps asking for one; once it stops, the retained frame
+expires back to display-derived state instead of outranking newer display
+telemetry and borrowing its timestamp to call itself current. `status-poll` is
+deliberately not expired on that rule — it is refreshed by the server own
+polling, whose age `recentContact` already reports truthfully, and it has no
+second source running ahead of it the way a lease does.
+
+Arming is serialized against session setup. `POST /api/v1/settings` is refused
+with 409 when it would arm automatic fan control or overtemperature standby
+during a lease, and the decision is taken inside the same mutex that claims the
+port, so an update cannot race a session being established. The reverse gate —
+refusing a session while those controls are armed — is the same rule seen from
+the other end, and the two read the armed set through the same definition.
+
 `GET /api/v1/raw-passthrough` reports whether a client is connected,
 `blockedByArmedControls` when a session would currently be refused, and
 `tapFresh` for display freshness. `automaticControlsAvailable` reports serial
 port ownership: false for the lifetime of a lease, true whenever no client holds
 the port. It is not a statement that any control is armed —
-`blockedByArmedControls` is what reports that. An operator is never left to infer
-safety that is not present.
+`blockedByArmedControls` is what reports that. `enabled` means configured *and* running, so a
+listener that failed to bind reports `enabled: false`; `listenerAvailable` and
+the bind error in `note` are what separate that from a passthrough the operator
+turned off. An operator is never left to infer safety that
+is not present.
 
 ### `cmd/server`
 

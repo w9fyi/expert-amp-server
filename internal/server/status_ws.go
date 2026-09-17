@@ -34,16 +34,30 @@ func handleStatusWebsocket(opts Options) http.HandlerFunc {
 		_ = conn.SetReadDeadline(time.Time{})
 		conn.SetPongHandler(func(string) error { return nil })
 
+		// Subscribe before resolving the first payload, never after. Authority
+		// can change between the two -- a lease invalidating the retained frame,
+		// or the first poll after one restoring it -- and a transition published
+		// into that gap reaches nobody, because this connection is not a
+		// subscriber yet. The socket then waits for the next wake-up that may
+		// never come: a static display publishes nothing, and a steady-state
+		// amplifier repeats its status bytes, so it can serve the wrong
+		// authority for the life of the connection.
+		//
+		// Subscribing first cannot lose it. The channels are buffered and
+		// pushStatus overwrites rather than drops, so a transition that lands
+		// before the initial Resolve stays queued and the loop immediately
+		// rechecks; if that Resolve already saw the new state, sendIfChanged
+		// finds nothing to send. Either order of arrival ends up correct.
+		statusUpdates, unsubscribeStatus := subscribeStatus(opts)
+		defer unsubscribeStatus()
+		snapshotUpdates, unsubscribeSnapshots := subscribeSnapshots(opts.Store)
+		defer unsubscribeSnapshots()
+
 		status := selectedStatus(opts)
 		if err := writeStatusWebsocketMessage(conn, status); err != nil {
 			return
 		}
 		last := status
-
-		statusUpdates, unsubscribeStatus := subscribeStatus(opts)
-		defer unsubscribeStatus()
-		snapshotUpdates, unsubscribeSnapshots := subscribeSnapshots(opts.Store)
-		defer unsubscribeSnapshots()
 
 		pingTicker := time.NewTicker(30 * time.Second)
 		defer pingTicker.Stop()

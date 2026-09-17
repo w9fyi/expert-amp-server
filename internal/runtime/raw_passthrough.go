@@ -70,6 +70,16 @@ func (h *RawPassthroughHandle) Port() serial.Port { return h.port }
 // lifecycleMu is held for the full duration. rawPassthroughActive, set under
 // writeMu, is what makes concurrent server writes fail fast instead of blocking
 // on that lifecycleMu.
+//
+// The transition is marked under writeMu and writeMu is dropped before anything
+// waits, because the read loop is one of those writers. A scheduled poll takes
+// writeMu on its way into writeFrameForSerialSession, so holding writeMu across
+// the retire deadlocks the two against each other: the retire waits for the read
+// loop to unwind, and the read loop cannot unwind until it gets the mutex the
+// retire is holding. Acquisition then times out and refuses a client that should
+// have been let in. Marking first inverts it -- the parked poll acquires writeMu,
+// sees the flag, fails closed, and that failure is what ends the session the
+// retire is waiting for.
 func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthroughHandle, error) {
 	if s == nil {
 		return nil, ErrRawPassthroughUnavailable
@@ -83,19 +93,37 @@ func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthrough
 
 	release := func() { s.rawPassthroughClaim.Unlock() }
 
+	// Mark the transition, then get out of the read loop's way. Every server
+	// write from here on fails closed rather than reaching a port that is about
+	// to change hands; see the deadlock note above for why this cannot wait
+	// until the port is actually in hand.
 	s.writeMu.Lock()
+	s.rawPassthroughActive = true
+	s.writeMu.Unlock()
+
+	// abandon undoes the mark when acquisition does not complete. It always runs
+	// after lifecycleMu is released, never before: the reverse order leaves the
+	// flag reading false while lifecycleMu is still held, so a concurrent
+	// SendWake passes the gate and then blocks on lifecycleMu while holding the
+	// actuation coordinator's mutex. Close() orders itself the same way.
+	abandon := func() {
+		s.writeMu.Lock()
+		s.rawPassthroughActive = false
+		s.writeMu.Unlock()
+	}
+
 	s.lifecycleMu.Lock()
 
 	if err := ctx.Err(); err != nil {
 		s.lifecycleMu.Unlock()
-		s.writeMu.Unlock()
+		abandon()
 		release()
 		return nil, fmt.Errorf("raw passthrough not started, server is shutting down: %w", err)
 	}
 
 	if err := s.retireCurrentSessionForReason(ctx, "raw passthrough"); err != nil {
 		s.lifecycleMu.Unlock()
-		s.writeMu.Unlock()
+		abandon()
 		// The retire already cleared s.port even though it could not confirm the
 		// read loop unwound, so without this the loop would sit out its full
 		// backoff with no polling and no safety observation.
@@ -112,7 +140,7 @@ func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthrough
 	if err != nil {
 		// Nothing was handed over, so restore normal operation immediately.
 		s.lifecycleMu.Unlock()
-		s.writeMu.Unlock()
+		abandon()
 		s.signalReconnect()
 		release()
 		return nil, fmt.Errorf("open serial %s for raw passthrough: %w", s.cfg.Port, err)
@@ -123,7 +151,7 @@ func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthrough
 	if err := port.SetReadTimeout(s.cfg.ReadTimeout); err != nil {
 		_ = port.Close()
 		s.lifecycleMu.Unlock()
-		s.writeMu.Unlock()
+		abandon()
 		s.signalReconnect()
 		release()
 		return nil, fmt.Errorf("set read timeout for raw passthrough: %w", err)
@@ -132,7 +160,7 @@ func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthrough
 		if err := port.SetDTR(true); err != nil {
 			_ = port.Close()
 			s.lifecycleMu.Unlock()
-			s.writeMu.Unlock()
+			abandon()
 			s.signalReconnect()
 			release()
 			return nil, fmt.Errorf("set DTR for raw passthrough: %w", err)
@@ -142,21 +170,24 @@ func (s *SerialSource) BeginRawPassthrough(ctx context.Context) (*RawPassthrough
 		if err := port.SetRTS(true); err != nil {
 			_ = port.Close()
 			s.lifecycleMu.Unlock()
-			s.writeMu.Unlock()
+			abandon()
 			s.signalReconnect()
 			release()
 			return nil, fmt.Errorf("set RTS for raw passthrough: %w", err)
 		}
 	}
 
-	s.rawPassthroughActive = true
 	// The server's own polling stops here, so whatever status-poll frame is
 	// retained stops being evidence of current contact -- however recently it
 	// arrived. Canonical status falls back to display-derived state until a
-	// tapped 0x90 or the first poll after the lease supersedes it. The read loop
-	// is already retired, so no poll can land between this and the flag above.
+	// tapped 0x90 or the first poll after the lease supersedes it.
+	//
+	// Invalidating after the retire rather than before it is what makes this
+	// exact: the retire does not return until the read loop has unwound, so no
+	// poll reply can still be in flight to lift the invalidation the moment it
+	// is set. rawPassthroughActive has been true since before the retire began,
+	// so nothing could have started a new write either.
 	s.statusState.InvalidatePreLeaseStatus()
-	s.writeMu.Unlock()
 	// lifecycleMu stays held until Close: it is what keeps readLoop parked.
 
 	handle := &RawPassthroughHandle{

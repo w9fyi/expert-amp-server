@@ -172,7 +172,7 @@ func (s *StatusState) authoritativeLocked() bool {
 //
 // It stays cheap enough to do under the lock because pushStatus never blocks --
 // a full subscriber is drained and overwritten, never waited on. That is also
-// what keeps it safe to call from BeginRawPassthrough while it holds writeMu and
+// what keeps it safe to call from BeginRawPassthrough while it holds
 // lifecycleMu: the publisher acquires no further lock and never waits on a
 // subscriber, and a woken subscriber wants only this mutex, which it gets as
 // soon as the publisher returns.
@@ -206,6 +206,27 @@ func (s *StatusState) Resolve(snapshot Snapshot) api.Status {
 	if !authoritative {
 		return applyContactMetadata(fallback, snapshot.UpdatedAt, time.Time{})
 	}
+	// A tapped frame speaks for the amplifier only while the external client
+	// keeps asking for one, and nothing obliges it to. Expert Controller Plus
+	// never sends 0x90 at all, so a lease can produce one tapped frame -- or
+	// none -- and then nothing for its entire life while display frames keep
+	// arriving at full rate.
+	//
+	// Without this the retained tapped frame stays canonical forever: merging
+	// gives its nonzero fields precedence over the newer display telemetry, so
+	// a stale tapped temperature outranks a fresh display-derived one, and
+	// applyContactMetadata then reports recentContact from the newer display
+	// timestamp -- freshness borrowed from evidence that did not supply the
+	// reading. Expiring it back to display-derived state is the honest answer:
+	// the display is what is still being refreshed, so let it speak for itself.
+	//
+	// Only tapped provenance expires here. A status-poll frame is refreshed by
+	// the server's own polling, whose age recentContact already reports
+	// truthfully; it has no second source racing ahead of it the way a lease
+	// puts fresh display frames alongside a frozen tap.
+	if status.Provenance == ProvenancePassthroughTap && !tapStillSpeaks(protocolAt) {
+		return applyContactMetadata(fallback, snapshot.UpdatedAt, time.Time{})
+	}
 	// Resolve is the display path, so it merges tapped state too. The
 	// provenance travels with the merged status, so callers that need
 	// authority -- fan policy, overtemperature standby, menu debug -- still
@@ -216,6 +237,15 @@ func (s *StatusState) Resolve(snapshot Snapshot) api.Status {
 	resolved := mergeProtocolNativeStatus(status, fallback)
 	resolved = applyFreshDisplayOverrides(resolved, fallback, status, snapshot.UpdatedAt, protocolAt)
 	return applyContactMetadata(resolved, snapshot.UpdatedAt, protocolAt)
+}
+
+// tapStillSpeaks reports whether a passthrough-tapped status frame is recent
+// enough to stand as canonical status. It uses the same window as
+// RawPassthroughHandle.TapIsFresh, which is what /api/v1/raw-passthrough
+// already reports as tapFresh, so the endpoint and canonical status cannot
+// disagree about whether the tap is alive.
+func tapStillSpeaks(protocolAt time.Time) bool {
+	return !protocolAt.IsZero() && time.Since(protocolAt) <= RecentContactWindow
 }
 
 func (s *StatusState) protocolUpdatedAt() time.Time {

@@ -397,3 +397,165 @@ func TestNewReturnsNilWhenDisabled(t *testing.T) {
 		t.Fatal("expected nil controller without a serial source")
 	}
 }
+
+// Arming an automatic control while a raw client holds the port produces a
+// control that reports itself armed and cannot act: every serial write it would
+// make is refused for the life of the lease. The arming is refused instead.
+func TestHoldForArmingChangeRefusesWhileAClientHoldsThePort(t *testing.T) {
+	controller, _, cancel := newTestController(t)
+	defer cancel()
+	controller.cfg.ArmedAutomaticControls = func() []string { return nil }
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	addr := startListener(t, ctx, controller)
+
+	// Idle: arming is allowed, and the boundary is handed back cleanly.
+	release, err := controller.HoldForArmingChange([]string{"overtemperature standby"})
+	if err != nil {
+		t.Fatalf("idle HoldForArmingChange refused the arming: %v", err)
+	}
+	release()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	waitForLease(t, controller)
+
+	release, err = controller.HoldForArmingChange([]string{"overtemperature standby"})
+	if err == nil {
+		release()
+		t.Fatal("arming was allowed while a raw client held the port")
+	}
+	var leaseErr *ArmingDuringLeaseError
+	if !errors.As(err, &leaseErr) {
+		t.Fatalf("expected an *ArmingDuringLeaseError, got %T: %v", err, err)
+	}
+	if got := leaseErr.HTTPStatus(); got != http.StatusConflict {
+		t.Fatalf("HTTPStatus() = %d, want %d", got, http.StatusConflict)
+	}
+	if !strings.Contains(err.Error(), "overtemperature standby") {
+		t.Fatalf("error %q does not name the control it refused to arm", err.Error())
+	}
+}
+
+// The refusal has to be decided inside the same boundary that claims the port,
+// not beside it. While the arming holds that boundary, session setup cannot run
+// -- which is what stops an update from committing "armed" into a session that
+// is being established at the same moment.
+func TestHoldForArmingChangeSerializesAgainstSessionSetup(t *testing.T) {
+	controller, _, cancel := newTestController(t)
+	defer cancel()
+	controller.cfg.ArmedAutomaticControls = func() []string { return nil }
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	addr := startListener(t, ctx, controller)
+
+	release, err := controller.HoldForArmingChange([]string{"automatic fan control"})
+	if err != nil {
+		t.Fatalf("idle HoldForArmingChange refused the arming: %v", err)
+	}
+
+	// A client arriving mid-update cannot take the port while the hold is held.
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	settled := make(chan struct{})
+	go func() {
+		defer close(settled)
+		for {
+			controller.mu.Lock()
+			leased := controller.handle != nil
+			controller.mu.Unlock()
+			if leased {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+
+	select {
+	case <-settled:
+		t.Fatal("a session was established while an arming update held the setup boundary")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// Once the update commits, setup proceeds as normal.
+	release()
+	waitForLease(t, controller)
+}
+
+func waitForLease(t *testing.T, c *Controller) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		leased := c.handle != nil
+		c.mu.Unlock()
+		if leased {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no passthrough lease was established")
+}
+
+// A listener that never bound must not be reported as something a client could
+// connect to. Enabled is configuration; ListenerAvailable is fact.
+func TestStatusReportsTheListenerUnavailableWhenBindingFails(t *testing.T) {
+	controller, _, cancel := newTestController(t)
+	defer cancel()
+	controller.cfg.ArmedAutomaticControls = func() []string { return nil }
+
+	// Take the address first, then point the controller at it.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer occupied.Close()
+	controller.cfg.ListenAddress = occupied.Addr().String()
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	if err := controller.Start(ctx); err == nil {
+		t.Fatal("Start returned nil for an address already in use")
+	}
+
+	status := controller.Status()
+	if status.ListenerAvailable {
+		t.Fatal("listenerAvailable = true after the bind failed")
+	}
+	// "configured and running" is what enabled means; this one is not running.
+	if status.Enabled {
+		t.Fatal("enabled = true for a listener that never bound")
+	}
+	if !strings.Contains(status.Note, "listener is unavailable") {
+		t.Fatalf("note %q does not report the listener as unavailable", status.Note)
+	}
+}
+
+// The happy path still reports an available listener, so the flag cannot be
+// satisfied by simply always reporting false.
+func TestStatusReportsTheListenerAvailableOnceBound(t *testing.T) {
+	controller, _, cancel := newTestController(t)
+	defer cancel()
+	controller.cfg.ArmedAutomaticControls = func() []string { return nil }
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	startListener(t, ctx, controller)
+
+	if status := controller.Status(); !status.ListenerAvailable {
+		t.Fatalf("listenerAvailable = false while bound and accepting: %+v", status)
+	}
+}

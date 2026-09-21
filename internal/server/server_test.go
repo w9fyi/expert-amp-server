@@ -4466,17 +4466,37 @@ func TestV1SettingsRejectsPassthroughWithoutPolling(t *testing.T) {
 		return rec
 	}
 
-	// Turning polling off while passthrough is enabled is refused, as is
-	// enabling passthrough on a configuration that already has polling off.
-	rec := post(t, `{"rawPassthroughEnabled":true,"pollingMode":"off"}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	// Turning polling off while passthrough is enabled is refused, in every
+	// spelling that reaches storage as "off". The request is validated before
+	// the manager normalizes it, so a check against the raw value lets
+	// "OFF" and " off " through and then stores exactly the state it refused.
+	for _, mode := range []string{"off", "OFF", "Off", " off ", "\toff\n"} {
+		body, err := json.Marshal(map[string]any{"rawPassthroughEnabled": true, "pollingMode": mode})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		rec := post(t, string(body))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("pollingMode %q: status = %d, want 400; body=%s", mode, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "pollingMode") {
+			t.Fatalf("pollingMode %q: body %q does not name the setting that has to change", mode, rec.Body.String())
+		}
+		if settings := mgr.Get().Settings; settings.RawPassthroughEnabled || settings.PollingMode == string(config.PollingModeOff) {
+			t.Fatalf("pollingMode %q: the refused combination was persisted anyway: %+v", mode, settings)
+		}
 	}
-	if !strings.Contains(rec.Body.String(), "pollingMode") {
-		t.Fatalf("body %q does not name the setting that has to change", rec.Body.String())
+
+	// A value that normalizes to something else is not this conflict at all:
+	// unrecognized modes become "both", so they must still be accepted.
+	if rec := post(t, `{"rawPassthroughEnabled":true,"pollingMode":"not-a-mode"}`); rec.Code != http.StatusOK {
+		t.Fatalf("unrecognized polling mode: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if settings := mgr.Get().Settings; settings.RawPassthroughEnabled || settings.PollingMode == string(config.PollingModeOff) {
-		t.Fatalf("the refused combination was persisted anyway: %+v", settings)
+	if settings := mgr.Get().Settings; settings.PollingMode != string(config.PollingModeBoth) {
+		t.Fatalf("pollingMode = %q, want it normalized to both", settings.PollingMode)
+	}
+	if rec := post(t, `{"rawPassthroughEnabled":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("disabling passthrough: status = %d body=%s", rec.Code, rec.Body.String())
 	}
 
 	// Either setting alone is fine.

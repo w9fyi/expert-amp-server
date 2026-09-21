@@ -794,7 +794,19 @@ func handleSettingsUpdateAPI(w http.ResponseWriter, r *http.Request, mgr *config
 	)
 	err = passthrough.HoldForSettingsTransaction(func(leased bool) error {
 		current = mgr.Get().Settings
-		nextSettings := mergeSettingsRequest(current, req)
+
+		// Decide everything below on the stored form of the merged request,
+		// never on the request's own spelling of it. Update normalizes on the
+		// way to disk -- it trims and lowercases pollingMode, and derives it
+		// from the legacy booleans when it is blank -- so a candidate judged as
+		// written can be committed as something else, and a check that compares
+		// against the canonical value accepts "OFF" and then saves "off": the
+		// exact state it exists to refuse. current is already stored, so both
+		// sides of every comparison here are now in the same form.
+		//
+		// Normalization is idempotent, so committing this value stores it
+		// unchanged: what was validated is what lands on disk.
+		nextSettings := mgr.Normalized(mergeSettingsRequest(current, req))
 
 		if err := validatePassthroughPrerequisites(nextSettings); err != nil {
 			return err
@@ -840,6 +852,10 @@ func settingsUpdateStatus(err error) int {
 
 // validatePassthroughPrerequisites refuses a settings combination that asks for
 // raw passthrough and removes what it runs on.
+//
+// It must be given normalized settings -- see config.Manager.Normalized. The
+// value it compares is the one that reaches disk, and the request's spelling of
+// it is not that value.
 //
 // Passthrough leases the serial source, and no serial source is built while
 // pollingMode is off, so the two settings contradict each other: the saved

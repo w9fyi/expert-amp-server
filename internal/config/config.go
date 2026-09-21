@@ -276,6 +276,25 @@ func (m *Manager) Get() Snapshot {
 	}
 }
 
+// Normalized returns next exactly as Update would store it, without storing it
+// or validating it.
+//
+// Callers that have to judge a candidate update before committing it need to
+// judge the stored form, not the requested one. Update trims and lowercases
+// pollingMode and, when it is blank, derives it from the legacy polling
+// booleans instead -- so "OFF", " off " and three false booleans all reach disk
+// as "off" while comparing equal to none of it beforehand. Answering such a
+// question against the raw request is how a check comes to accept exactly the
+// state it exists to refuse.
+//
+// Normalization is pure and idempotent, so normalizing here and letting Update
+// normalize again on commit costs nothing and cannot disagree.
+func (m *Manager) Normalized(next Settings) Settings {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return normalizeSettings(next, DefaultSettings(m.cur.ListenAddress))
+}
+
 func (m *Manager) Update(next Settings) (Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

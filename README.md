@@ -74,6 +74,15 @@ virtual COM port) so a single external client — such as SPE Expert Controller
 over TCP/IP — can drive the amplifier through the machine already running this
 server, with no second cable.
 
+**It requires a configured `serialPort` and a `pollingMode` other than `off`.**
+Passthrough leases the serial source, and no serial source is created while
+polling is off, so the two settings contradict each other: `POST
+/api/v1/settings` refuses the combination with HTTP 400 rather than saving a
+configuration that asks for passthrough and reports it unavailable. A
+configuration already on disk still starts — a conflict you can fix with one
+request should not stop the server and take overtemperature standby down with
+it — and `GET /api/v1/raw-passthrough` says in `note` which setting won.
+
 The amplifier tolerates one serial master, so this is an exclusive lease. While
 a client is connected the server stops its own polling and refuses its own
 button and wake writes with HTTP 409; on disconnect it reclaims the port and

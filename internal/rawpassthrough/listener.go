@@ -96,34 +96,55 @@ func (e *ArmingDuringLeaseError) Error() string {
 // succeeds unchanged once the lease ends.
 func (e *ArmingDuringLeaseError) HTTPStatus() int { return http.StatusConflict }
 
-// HoldForArmingChange reserves the session-setup boundary so that arming an
-// automatic control and starting a passthrough session cannot interleave.
+// ErrArmingDuringLease builds the refusal for controls an update would arm
+// while a client holds the port.
+func ErrArmingDuringLease(controls []string) error {
+	return &ArmingDuringLeaseError{Controls: controls}
+}
+
+// HoldForSettingsTransaction runs commit inside the session-setup boundary, so
+// that a settings update and the start of a passthrough session cannot
+// interleave. leased reports whether a client holds the port, read inside that
+// boundary and therefore still true when commit acts on it.
 //
-// A check that merely asked "is a client connected?" and then returned would
-// not be enough. serve decides the refusal and claims the port under setupMu,
-// so a settings update racing it could read "no client", get descheduled, and
-// commit the arming while a session was being established -- leaving controls
-// that report themselves armed for a lease that blocks every write they would
-// make. Taking the same mutex is what removes the window: either serve claims
-// the port first and this returns the conflict, or this holds the boundary and
-// serve blocks until the arming is committed, whereupon its existing armed
-// controls check refuses the client for the stated reason.
+// Reading the answer somewhere else and passing it in would not be enough, and
+// neither would reading it here and returning it. serve decides its own refusal
+// and claims the port under setupMu, so an update that sampled "no client" and
+// then went away to read, merge and commit could be overtaken by a session being
+// established -- leaving controls that report themselves armed for a lease that
+// blocks every write they would make. Holding the boundary across the whole
+// commit is what removes the window: either serve claims the port first and
+// commit sees leased true, or commit holds the boundary and serve blocks until
+// the update is written, whereupon its existing armed-controls check refuses the
+// client for the stated reason.
 //
-// The caller must call the returned release exactly once when the update has
-// been committed. controls is only used to name the conflict.
-func (c *Controller) HoldForArmingChange(controls []string) (func(), error) {
+// Everything the update decides has to be read inside commit -- what the
+// settings currently are, what merging the request produces, and whether that
+// newly arms anything. A value captured before the call is exactly the stale
+// snapshot this boundary exists to prevent, however carefully the boundary
+// itself is held.
+//
+// Lock order, which is not obvious and cannot be inverted: callers may hold a
+// mutex of their own above this, and commit may take config.Manager's lock
+// below it, because serve already establishes setupMu -> config.Manager.mu when
+// it reads the armed controls. Anything that held config.Manager's lock across
+// this call would invert that pair and deadlock against a connecting client, so
+// config reads and writes inside commit must be leaf calls that take and release
+// that lock themselves.
+//
+// A nil controller means passthrough is not configured at all: there is no
+// boundary to take and no lease to conflict with, so commit runs with leased
+// false.
+func (c *Controller) HoldForSettingsTransaction(commit func(leased bool) error) error {
 	if c == nil {
-		return func() {}, nil
+		return commit(false)
 	}
 	c.setupMu.Lock()
+	defer c.setupMu.Unlock()
 	c.mu.Lock()
 	leased := c.handle != nil
 	c.mu.Unlock()
-	if leased {
-		c.setupMu.Unlock()
-		return nil, &ArmingDuringLeaseError{Controls: controls}
-	}
-	return func() { c.setupMu.Unlock() }, nil
+	return commit(leased)
 }
 
 // armedControls reports which server-side automatic controls are armed.
@@ -443,9 +464,14 @@ type Status struct {
 	AutomaticControlsAvailable bool `json:"automaticControlsAvailable"`
 
 	// ListenerAvailable reports whether the TCP listener is actually accepting.
-	// Enabled is configuration; this is runtime. They disagree when binding
-	// fails, and without it the endpoint reports an enabled passthrough that no
-	// client can ever reach.
+	//
+	// It does not disagree with Enabled when binding fails: Enabled means
+	// configured *and* running, so a listener that never bound sets both false.
+	// What this field adds is which of those two it was -- false here alongside
+	// a bind error in Note is a passthrough that could not start, where both
+	// false and no error is one the operator turned off. The only state where
+	// the two genuinely differ is a controller that has been constructed but has
+	// not started listening yet.
 	ListenerAvailable bool `json:"listenerAvailable"`
 
 	Note string `json:"note,omitempty"`

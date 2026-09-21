@@ -19,6 +19,24 @@ var statusWebsocketUpgrader = websocket.Upgrader{
 	},
 }
 
+// statusRecheckInterval bounds how long an open socket can serve a status view
+// that has expired on a timer rather than by anything being published.
+//
+// Not every change to canonical status arrives as an event. Tapped status stops
+// being authoritative once it is older than runtime.RecentContactWindow, and
+// recentContact ages out the same way: both are decided inside Resolve, from the
+// clock, so the moment they flip nobody calls UpdateProtocolNative and nobody
+// calls InvalidatePreLeaseStatus. A socket waiting only on subscriptions never
+// learns. That is not a corner case -- a lease whose client stops polling 0x90
+// against a static amplifier screen publishes nothing at all, which is the
+// measured behavior of a real Expert Controller Plus session.
+//
+// One second matches the cadence safetyContactLoop already uses to notice the
+// same staleness, and bounds the lag to about a second past the window.
+// Re-resolving costs nothing visible: sendIfChanged compares against the last
+// payload and writes only on a difference, so a steady socket stays silent.
+const statusRecheckInterval = time.Second
+
 func handleStatusWebsocket(opts Options) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethodAPI(w, r, http.MethodGet) {
@@ -62,6 +80,13 @@ func handleStatusWebsocket(opts Options) http.HandlerFunc {
 		pingTicker := time.NewTicker(30 * time.Second)
 		defer pingTicker.Stop()
 
+		// See statusRecheckInterval: the ping ticker deliberately does not
+		// re-resolve, so without this the only things that can move this socket
+		// are published events -- and a status view that expires on the clock
+		// publishes none.
+		recheckTicker := time.NewTicker(statusRecheckInterval)
+		defer recheckTicker.Stop()
+
 		sendIfChanged := func() error {
 			status := selectedStatus(opts)
 			if reflect.DeepEqual(status, last) {
@@ -81,6 +106,10 @@ func handleStatusWebsocket(opts Options) http.HandlerFunc {
 			case <-pingTicker.C:
 				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			case <-recheckTicker.C:
+				if err := sendIfChanged(); err != nil {
 					return
 				}
 			case _, ok := <-statusUpdates:

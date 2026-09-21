@@ -9,6 +9,7 @@ import (
 	"image/png"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/FtlC-ian/expert-amp-server/internal/api"
@@ -521,12 +522,18 @@ func NewHandler(opts Options) http.Handler {
 	})
 
 	if opts.Config != nil {
+		// One settings update at a time. Each reads the current settings and
+		// merges a partial request onto them, so two in flight together would
+		// both merge onto the same starting point and the second would silently
+		// undo the first. See handleSettingsUpdateAPI for why this cannot be
+		// left to the passthrough setup boundary.
+		var settingsMu sync.Mutex
 		mux.HandleFunc("/api/v1/settings", func(w http.ResponseWriter, r *http.Request) {
 			switch r.Method {
 			case http.MethodGet:
 				writeAPI(w, http.StatusOK, api.Response{Success: true, Data: opts.Config.Get()})
 			case http.MethodPost:
-				handleSettingsUpdateAPI(w, r, opts.Config, opts.RawPassthrough, func(settings config.Settings) {
+				handleSettingsUpdateAPI(w, r, opts.Config, opts.RawPassthrough, &settingsMu, func(settings config.Settings) {
 					status := opts.StatusState.CurrentProtocolNativeWithContact()
 					opts.FanPolicy.UpdateSettings(status, fanPolicySettings(settings))
 				})
@@ -741,8 +748,32 @@ func handleWakeActionAPI(w http.ResponseWriter, r *http.Request, wakeTransport t
 	writeAPI(w, http.StatusOK, api.Response{Success: true, Message: "wake sent", Data: result})
 }
 
-func handleSettingsUpdateAPI(w http.ResponseWriter, r *http.Request, mgr *config.Manager, passthrough *rawpassthrough.Controller, settingsApplied func(config.Settings)) {
-	current := mgr.Get()
+// handleSettingsUpdateAPI applies a settings update as one serialized
+// transaction: read what the settings are now, merge the request onto that,
+// validate the result, decide whether it arms anything, and commit -- with no
+// point in the middle where another writer or a connecting client can change
+// the answer underneath it.
+//
+// Reading the current settings before the request body is what made that
+// impossible. Decoding a body is network I/O of unbounded duration, so a slow
+// or stalled client stretched the gap between the read and the commit
+// arbitrarily: another update could disarm a control and a passthrough client
+// could take the port, and this request would still merge onto the snapshot it
+// took at the start. It cost three separate things -- the armed-control
+// transition disappeared, because both the stale value and the merged one read
+// armed and controlsNewlyArmedBy compares the two; every field the other writer
+// changed was silently overwritten; and settingsMessage computed what needs a
+// restart against settings that were already several updates old.
+//
+// So the body is decoded first and outside every lock, and nothing is read from
+// the manager until the boundary is held. Holding a lock across the body read
+// would trade the stale snapshot for a stalled client that can block session
+// setup for as long as it likes, which is the worse of the two.
+//
+// settingsMu serializes this against other settings updates. It cannot be left
+// to the passthrough boundary: that is a no-op when passthrough is not
+// configured, which is every default install.
+func handleSettingsUpdateAPI(w http.ResponseWriter, r *http.Request, mgr *config.Manager, passthrough *rawpassthrough.Controller, settingsMu *sync.Mutex, settingsApplied func(config.Settings)) {
 	req, err := decodeSettingsRequest(r)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -753,32 +784,84 @@ func handleSettingsUpdateAPI(w http.ResponseWriter, r *http.Request, mgr *config
 		writeAPIError(w, http.StatusBadRequest, "automatic fan policy thresholds must be greater than zero")
 		return
 	}
-	nextSettings := mergeSettingsRequest(current.Settings, req)
 
-	// An automatic control that is armed while a raw client holds the port is a
-	// lie: it reports itself armed, and every serial write it would make is
-	// refused for the life of the lease. Refuse the arming instead, and hold the
-	// passthrough setup boundary across the commit so a session cannot be
-	// established in the gap between deciding and writing. Disarming is never
-	// blocked, and neither is any other setting.
-	if arming := controlsNewlyArmedBy(current.Settings, nextSettings); len(arming) > 0 {
-		release, err := passthrough.HoldForArmingChange(arming)
-		if err != nil {
-			writeAPIError(w, conflictStatus(err), err.Error())
-			return
+	settingsMu.Lock()
+	defer settingsMu.Unlock()
+
+	var (
+		current config.Settings
+		next    config.Snapshot
+	)
+	err = passthrough.HoldForSettingsTransaction(func(leased bool) error {
+		current = mgr.Get().Settings
+		nextSettings := mergeSettingsRequest(current, req)
+
+		if err := validatePassthroughPrerequisites(nextSettings); err != nil {
+			return err
 		}
-		defer release()
-	}
 
-	next, err := mgr.Update(nextSettings)
+		// An automatic control that is armed while a raw client holds the port
+		// is a lie: it reports itself armed, and every serial write it would
+		// make is refused for the life of the lease. Refuse the arming instead.
+		// Disarming is never blocked, and neither is any other setting.
+		if arming := controlsNewlyArmedBy(current, nextSettings); len(arming) > 0 && leased {
+			return rawpassthrough.ErrArmingDuringLease(arming)
+		}
+
+		committed, err := mgr.Update(nextSettings)
+		if err != nil {
+			return err
+		}
+		next = committed
+		if settingsApplied != nil {
+			settingsApplied(next.Settings)
+		}
+		return nil
+	})
 	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, err.Error())
+		writeAPIError(w, settingsUpdateStatus(err), err.Error())
 		return
 	}
-	if settingsApplied != nil {
-		settingsApplied(next.Settings)
+
+	writeAPI(w, http.StatusOK, api.Response{Success: true, Message: settingsMessage(current, next.Settings), Data: next})
+}
+
+// settingsUpdateStatus maps a failed settings transaction to its status. A
+// conflict with live state carries its own -- 409, and the request succeeds
+// unchanged once that state clears -- while everything else is the request
+// itself being wrong.
+func settingsUpdateStatus(err error) int {
+	var coded interface{ HTTPStatus() int }
+	if errors.As(err, &coded) {
+		return coded.HTTPStatus()
 	}
-	writeAPI(w, http.StatusOK, api.Response{Success: true, Message: settingsMessage(current.Settings, next.Settings), Data: next})
+	return http.StatusBadRequest
+}
+
+// validatePassthroughPrerequisites refuses a settings combination that asks for
+// raw passthrough and removes what it runs on.
+//
+// Passthrough leases the serial source, and no serial source is built while
+// pollingMode is off, so the two settings contradict each other: the saved
+// configuration says passthrough is enabled and the server reports it
+// unavailable, with nothing in between to say why. Refusing the update is what
+// stops that state being created in the first place.
+//
+// It is deliberately here rather than in config's own validation, which
+// LoadOrCreate shares: a rejection there would also refuse to start on a
+// configuration that is already on disk, and a server that will not start is a
+// server whose overtemperature standby is not running. Turning an operator's
+// existing config into a boot failure is too much for a conflict they can fix
+// with one request, so an already-saved combination still starts and is
+// explained by rawPassthroughUnavailableNote instead.
+func validatePassthroughPrerequisites(settings config.Settings) error {
+	if !settings.RawPassthroughEnabled {
+		return nil
+	}
+	if settings.PollingMode == string(config.PollingModeOff) {
+		return errors.New("raw passthrough requires polling: set pollingMode to display, status or both, or disable rawPassthroughEnabled")
+	}
+	return nil
 }
 
 // rawPassthroughUnavailableNote explains why no passthrough controller exists.
@@ -786,8 +869,14 @@ func handleSettingsUpdateAPI(w http.ResponseWriter, r *http.Request, mgr *config
 // "Disabled" is the wrong word for a configuration that asks for passthrough,
 // names a serial port, and still gets nothing: passthrough needs a serial
 // source, and no serial source is built while pollingMode is off, so the two
-// settings silently contradict each other. Saying which one won is the whole
-// point of this note -- the configuration is rejected, not quietly ignored.
+// settings contradict each other. Saying which one won is the whole point of
+// this note.
+//
+// POST /api/v1/settings now refuses to create that combination, so the only way
+// to reach the pollingMode branch below is a configuration that was already on
+// disk -- hand-edited, or saved before the update path rejected it. Those still
+// start, deliberately, rather than turning an operator's existing config into a
+// boot failure; see validatePassthroughPrerequisites.
 func rawPassthroughUnavailableNote(mgr *config.Manager) string {
 	const disabled = "raw serial passthrough is disabled; the server owns the serial port"
 	if mgr == nil {
@@ -841,15 +930,6 @@ func controlsNewlyArmedBy(current, next config.Settings) []string {
 		}
 	}
 	return added
-}
-
-// conflictStatus reads the HTTP status an error carries, defaulting to 409.
-func conflictStatus(err error) int {
-	var coded interface{ HTTPStatus() int }
-	if errors.As(err, &coded) {
-		return coded.HTTPStatus()
-	}
-	return http.StatusConflict
 }
 
 func decodeSettingsRequest(r *http.Request) (settingsRequest, error) {

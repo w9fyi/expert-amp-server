@@ -222,6 +222,28 @@ port, so an update cannot race a session being established. The reverse gate —
 refusing a session while those controls are armed — is the same rule seen from
 the other end, and the two read the armed set through the same definition.
 
+A settings update is one transaction, and the boundary has to contain the read
+as well as the commit. The request body is decoded first, outside every lock,
+because decoding is network I/O of unbounded duration and a stalled client must
+not be able to hold session setup; only then does the handler take its own
+settings mutex, enter the passthrough boundary, and read the current settings,
+merge, validate, decide arming and write. Reading the settings before the body —
+as it once did — meant the arming decision compared a snapshot that a concurrent
+disarm had already superseded, so both sides read armed, no transition was seen,
+and the boundary was skipped entirely. The lock order is settings mutex, then
+the passthrough setup mutex, then the config manager's own lock: session setup
+already takes the setup mutex before reading the armed set from config, so
+holding the config lock across the boundary would invert that pair and deadlock
+against a connecting client.
+
+Raw passthrough also requires polling. With `pollingMode: "off"` no serial
+source is created, so there is nothing to lease; the settings route refuses that
+combination with 400 rather than storing a configuration that asks for
+passthrough and reports it unavailable. Validation lives in the route rather
+than in config's own validators, which `LoadOrCreate` shares: refusing there
+would turn a configuration already on disk into a startup failure, and a server
+that will not start is a server whose overtemperature standby is not running.
+
 `GET /api/v1/raw-passthrough` reports whether a client is connected,
 `blockedByArmedControls` when a session would currently be refused, and
 `tapFresh` for display freshness. `automaticControlsAvailable` reports serial

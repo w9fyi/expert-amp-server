@@ -400,8 +400,9 @@ func TestNewReturnsNilWhenDisabled(t *testing.T) {
 
 // Arming an automatic control while a raw client holds the port produces a
 // control that reports itself armed and cannot act: every serial write it would
-// make is refused for the life of the lease. The arming is refused instead.
-func TestHoldForArmingChangeRefusesWhileAClientHoldsThePort(t *testing.T) {
+// make is refused for the life of the lease. The transaction is told so, and
+// refuses the arming instead.
+func TestHoldForSettingsTransactionReportsAClientHoldingThePort(t *testing.T) {
 	controller, _, cancel := newTestController(t)
 	defer cancel()
 	controller.cfg.ArmedAutomaticControls = func() []string { return nil }
@@ -410,12 +411,20 @@ func TestHoldForArmingChangeRefusesWhileAClientHoldsThePort(t *testing.T) {
 	defer stop()
 	addr := startListener(t, ctx, controller)
 
-	// Idle: arming is allowed, and the boundary is handed back cleanly.
-	release, err := controller.HoldForArmingChange([]string{"overtemperature standby"})
-	if err != nil {
-		t.Fatalf("idle HoldForArmingChange refused the arming: %v", err)
+	// Idle: nothing holds the port, so an update is free to arm.
+	ran := false
+	if err := controller.HoldForSettingsTransaction(func(leased bool) error {
+		ran = true
+		if leased {
+			t.Error("leased = true with no client connected")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("idle transaction returned %v", err)
 	}
-	release()
+	if !ran {
+		t.Fatal("the commit never ran")
+	}
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -424,10 +433,17 @@ func TestHoldForArmingChangeRefusesWhileAClientHoldsThePort(t *testing.T) {
 	defer conn.Close()
 	waitForLease(t, controller)
 
-	release, err = controller.HoldForArmingChange([]string{"overtemperature standby"})
+	// Leased: the commit is still run -- disarming and unrelated settings must
+	// not be blocked -- but it is told the port is held, so it can refuse only
+	// what actually conflicts.
+	err = controller.HoldForSettingsTransaction(func(leased bool) error {
+		if !leased {
+			t.Error("leased = false while a raw client held the port")
+		}
+		return ErrArmingDuringLease([]string{"overtemperature standby"})
+	})
 	if err == nil {
-		release()
-		t.Fatal("arming was allowed while a raw client held the port")
+		t.Fatal("the refusal did not reach the caller")
 	}
 	var leaseErr *ArmingDuringLeaseError
 	if !errors.As(err, &leaseErr) {
@@ -441,11 +457,11 @@ func TestHoldForArmingChangeRefusesWhileAClientHoldsThePort(t *testing.T) {
 	}
 }
 
-// The refusal has to be decided inside the same boundary that claims the port,
-// not beside it. While the arming holds that boundary, session setup cannot run
-// -- which is what stops an update from committing "armed" into a session that
-// is being established at the same moment.
-func TestHoldForArmingChangeSerializesAgainstSessionSetup(t *testing.T) {
+// The decision has to be taken inside the same boundary that claims the port,
+// and stay true for as long as the update takes to commit. While a transaction
+// runs, session setup cannot -- which is what stops an update from writing
+// "armed" into a session being established at the same moment.
+func TestHoldForSettingsTransactionSerializesAgainstSessionSetup(t *testing.T) {
 	controller, _, cancel := newTestController(t)
 	defer cancel()
 	controller.cfg.ArmedAutomaticControls = func() []string { return nil }
@@ -454,12 +470,22 @@ func TestHoldForArmingChangeSerializesAgainstSessionSetup(t *testing.T) {
 	defer stop()
 	addr := startListener(t, ctx, controller)
 
-	release, err := controller.HoldForArmingChange([]string{"automatic fan control"})
-	if err != nil {
-		t.Fatalf("idle HoldForArmingChange refused the arming: %v", err)
-	}
+	committing := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- controller.HoldForSettingsTransaction(func(leased bool) error {
+			if leased {
+				t.Error("leased = true before any client connected")
+			}
+			close(committing)
+			<-release
+			return nil
+		})
+	}()
+	<-committing
 
-	// A client arriving mid-update cannot take the port while the hold is held.
+	// A client arriving mid-transaction cannot take the port until it commits.
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -486,12 +512,15 @@ func TestHoldForArmingChangeSerializesAgainstSessionSetup(t *testing.T) {
 
 	select {
 	case <-settled:
-		t.Fatal("a session was established while an arming update held the setup boundary")
+		t.Fatal("a session was established while a settings transaction held the setup boundary")
 	case <-time.After(250 * time.Millisecond):
 	}
 
 	// Once the update commits, setup proceeds as normal.
-	release()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("transaction returned %v", err)
+	}
 	waitForLease(t, controller)
 }
 
